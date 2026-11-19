@@ -11,6 +11,7 @@
 
 const { app, BrowserWindow, Menu, shell, dialog, ipcMain } = require('electron');
 const path = require('node:path');
+const os = require('node:os');
 const fs = require('node:fs');
 const http = require('node:http');
 const { spawn, execFileSync } = require('node:child_process');
@@ -53,7 +54,7 @@ function resolveNode() {
   const fixed = [
     process.env.CONSOLE_NODE_BIN,
     'C:\\Program Files\\nodejs\\node.exe',
-    'C:\\Users\\<user>\\AppData\\Local\\Programs\\nodejs\\node.exe',
+    path.join(os.homedir(), 'AppData', 'Local', 'Programs', 'nodejs', 'node.exe'),
   ].filter(Boolean);
 
   for (const p of fixed) {

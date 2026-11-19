@@ -1,7 +1,7 @@
 Built-in imagegen edit prompt used for the production transparent master:
 Edit the provided APPROVED icon concept presentation into ONE production master app icon on a truly transparent background. Preserve the design of the large left icon faithfully: rounded square optical glass plaque with three rounded thick liquid glass pebbles, upper pebble blue at center top, bottom-left pebble blue, bottom-right pebble champagne gold. Preserve original proportions, original pebbles, glass highlights and icy blue/silver rim. No redesign, no new symbols. Extract and cleanly re-render ONLY that icon, front-facing, square, perfectly centered, filling 90-94 percent of image width and height with consistent small transparent margins. Single 1024x1024 or larger square icon. Outside rounded-square boundary completely transparent alpha, no floor shadow or backdrop glow, no rectangular background. Retain lightly smoked blue translucent interior of icon for legibility on arbitrary wallpapers, strong bright edge highlights and liquid optical refraction. Three glass bodies well separated. Remove ALL presentation text, labels, miniatures, sample tiles and surrounding scene. It must look like the approved icon as closely as possible, not an interpretation. No typography at all.
 
-Source concept: exec-<source-concept>.png
-Generated master: exec-<generated-master>.png
+Source concept: <source-concept>.png
+Generated master: <generated-master>.png
 Workspace master: assets/santi-liquid-glass-master.png
 Conversion: Pillow ICO encoding at 16,20,24,32,40,48,64,96,128,256; no redraw.

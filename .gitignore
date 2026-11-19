@@ -56,3 +56,6 @@ tools/.test-console-identity.json
 
 # 根目录用户状态（归档/置顶，本机运行态）
 /.console-state.json
+
+# 冒烟测试临时目录
+tools/.smoke-home/

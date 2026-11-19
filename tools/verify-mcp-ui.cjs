@@ -1,5 +1,5 @@
 const {app,BrowserWindow,ipcMain}=require('electron');const fs=require('node:fs'),path=require('node:path'),{pathToFileURL}=require('node:url'),{spawn}=require('node:child_process');
-const root=path.resolve(__dirname,'..'),dir=fs.mkdtempSync(path.join(__dirname,'.qa-mcp-')),node='C:/Users/<user>/AppData/Local/Programs/nodejs/node.exe';
+const root=path.resolve(__dirname,'..'),dir=fs.mkdtempSync(path.join(__dirname,'.qa-mcp-')),node=process.env.CONSOLE_NODE_BIN||'node';
 app.setPath('userData',path.join(dir,'electron'));app.commandLine.appendSwitch('no-sandbox');app.commandLine.appendSwitch('disable-gpu-sandbox');
 const env={...process.env,CONSOLE_PORT:'7827',CONSOLE_DATA_HOME:dir,CONSOLE_WORKBENCH_DIR:path.join(dir,'worker'),CONSOLE_STATE_FILE:path.join(dir,'state.json'),CONSOLE_IDENTITY_FILE:path.join(dir,'identity.json'),CONSOLE_TEST_MODE:'1',CONSOLE_TEST_ADAPTER:pathToFileURL(path.join(__dirname,'workbench-fake-adapter.mjs')).href,SANTI_TOKEN_FILE:path.join(dir,'mcp-token'),SANTI_URL:'http://127.0.0.1:7827',SANTI_MCP_PORT:'7797'};
 const delay=ms=>new Promise(r=>setTimeout(r,ms));let service,http,win;

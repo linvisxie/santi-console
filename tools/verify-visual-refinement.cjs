@@ -8,7 +8,7 @@ const delay=ms=>new Promise(r=>setTimeout(r,ms));
 function check(name,ok){results.checks.push({name,ok});if(!ok)throw Error(name);}
 app.whenReady().then(async()=>{
  try {
- server=spawn('C:/Users/<user>/AppData/Local/Programs/nodejs/node.exe',[path.join(root,'runtime/resources/app/server.mjs')],{windowsHide:true,env:{...process.env,CONSOLE_PORT:'7826',CONSOLE_DATA_HOME:dir,CONSOLE_WORKBENCH_DIR:path.join(dir,'worker'),CONSOLE_STATE_FILE:path.join(dir,'state.json'),CONSOLE_IDENTITY_FILE:path.join(dir,'server.json')},stdio:'ignore'});
+ server=spawn(process.env.CONSOLE_NODE_BIN||'node',[path.join(root,'runtime/resources/app/server.mjs')],{windowsHide:true,env:{...process.env,CONSOLE_PORT:'7826',CONSOLE_DATA_HOME:dir,CONSOLE_WORKBENCH_DIR:path.join(dir,'worker'),CONSOLE_STATE_FILE:path.join(dir,'state.json'),CONSOLE_IDENTITY_FILE:path.join(dir,'server.json')},stdio:'ignore'});
  for(let i=0;i<80;i++){try{if((await fetch('http://127.0.0.1:7826/')).ok)break;}catch{}await delay(250);}
  win=new BrowserWindow({width:1440,height:900,show:false,webPreferences:{sandbox:false,offscreen:true,backgroundThrottling:false}});
  const web=win.webContents,ev=s=>web.executeJavaScript(s);web.on('console-message',(_e,level,msg)=>{if(level===3)results.errors.push(msg);});

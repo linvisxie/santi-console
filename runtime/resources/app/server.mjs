@@ -2388,7 +2388,8 @@ const server = http.createServer(async (req, res) => {
     const segs = target.split(/[\\/]+/).filter(Boolean);
     // 只拒绝盘根（如 D://）和一级目录；两级及以上的项目目录允许删
     if (segs.length < 2) return sendJson(res, 400, { error: '拒绝删除盘根或一级目录' });
-    const BLOCK = ['c:\\', 'c:\\users', 'c:\\windows', 'c:\\program files', 'd:\\', 'c:\\users\\<user>'];
+    // 受保护目录：盘根、系统目录、用户目录本身。用户主目录按当前账户解析，不写死用户名。
+    const BLOCK = ['c:\\', 'c:\\users', 'c:\\windows', 'c:\\program files', 'd:\\', HOME].filter(Boolean);
     if (BLOCK.includes(target.toLowerCase()) || BLOCK.some((b) => target.toLowerCase() === path.resolve(b).toLowerCase()))
       return sendJson(res, 400, { error: '拒绝删除受保护目录' });
     const protectedPaths = [HERE, path.resolve(HERE, '../../..'), HOME, P.codexHome, P.wbHome, P.dshHome,
