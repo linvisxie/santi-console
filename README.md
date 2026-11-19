@@ -7,6 +7,11 @@
 
 全部在 **D 盘**，不占 C 盘。
 
+> **GitHub 仓库只放源码。** `runtime/` 下的 Electron 二进制（369MB 的 exe、dll、pak、locales）
+> 超出 GitHub 单文件限制，已由 `.gitignore` 排除；本地会话、附件、任务快照、快照 blob、
+> QA 截图与临时测试目录同样不入库。从仓库克隆到新机器时，把源码放回
+> `runtime/resources/app/` 再配一份 Electron 运行时即可，见文末「从仓库恢复运行环境」。
+
 ---
 
 ## 怎么启动
@@ -73,6 +78,22 @@ D:\santi-console\
 ```
 
 改 public 界面后按 `Ctrl+R` 即可生效；改主进程/服务/worker 需重启对应进程，活动任务期间不要强杀 worker。
+
+## 从仓库恢复运行环境
+
+仓库里只有源码，`runtime/` 的 Electron 二进制没有入库。新机器上：
+
+1. 克隆仓库，把 `runtime/resources/app/` 整个目录保留原位置。
+2. 取一份与本机版本一致的 Electron（`runtime/version` 里记录了版本号），
+   把 `electron.exe` 改名为 `三体控制台.exe` 放进 `runtime/`，或直接用
+   `npx electron runtime/resources/app` 启动调试。
+3. 需要双击入口时，用 `tools/make-launcher.py` 重新生成 `launch.cmd`（GBK + CRLF），
+   用 `tools/make-lnk.py` 生成桌面快捷方式，`tools/make-icon.py` 更新图标。
+4. 三家的原生 CLI（Codex / WorkBuddy / dsh）要各自在本机登录，三体只读取它们的
+   本地文件与会话，不自带模型凭据。
+
+桥接里的本机登录态（`bridges/wb-bridge/login-runtime/`）、`bridges/santi-mcp/grokbot-local.json`、
+`runtime/resources/app/.mcp/token` 都不会提交，换机器需要重新生成或登录。
 
 ## 从 C 盘搬了什么
 
