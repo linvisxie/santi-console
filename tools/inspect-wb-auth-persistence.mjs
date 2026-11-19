@@ -1,0 +1,1 @@
+import fs from 'node:fs';const s=fs.readFileSync('D:/workbuddy/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs','utf8');for(const needle of ['credentialsInMemory(){','async getAuthSavePath(){','async reconcileExternalChange(t)','isSecureSerializedSession']){const i=s.indexOf(needle);console.log(JSON.stringify({needle,context:s.slice(i-120,i+1500)}));}

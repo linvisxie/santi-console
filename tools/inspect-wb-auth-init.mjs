@@ -1,0 +1,1 @@
+import fs from 'node:fs';const s=fs.readFileSync('D:/workbuddy/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs','utf8');const at=s.indexOf('async doInit(){',7203000);console.log(s.slice(at,at+4300));

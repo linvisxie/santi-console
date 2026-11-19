@@ -1,0 +1,58 @@
+# ---- Electron 运行时二进制（369MB，超出 GitHub 限制，不入库）----
+# 只保留应用源码 runtime/resources/app/，其余运行时文件用官方 Electron 重新生成
+/runtime/*
+!/runtime/resources/
+/runtime/resources/*
+!/runtime/resources/app/
+
+# ---- 应用运行时产生的本地数据（含用户会话、附件、快照）----
+runtime/resources/app/.workbench/
+runtime/resources/app/.uploads/
+runtime/resources/app/.mcp/
+runtime/resources/app/.console-state.json
+runtime/resources/app/.session-metadata-cache.json
+
+# ---- 历史备份与 QA 临时目录 ----
+_archive/
+tools/.qa-*/
+tools/.native-*/
+tools/.permission-*/
+tools/.bridge-live-test/
+tools/.snapshot-bounds-check/
+tools/.test-console-identity.json
+
+# ---- QA 截图与产物（只保留根目录少量效果图）----
+tools/*.png
+tools/*.json
+tools/*.log
+
+# ---- 依赖与桥接登录态 ----
+node_modules/
+bridges/wb-bridge/login-runtime/
+bridges/wb-bridge/acp-runtime/
+bridges/wb-bridge/logs/
+bridges/santi-mcp/logs/
+bridges/santi-mcp/node_modules/
+bridges/santi-mcp/grokbot-local.json
+bridges/*/logs/
+
+# ---- 系统与编辑器 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+.vscode/
+.idea/
+
+# ---- 其余临时测试目录（保留 tools/.workbench-tests 之外的自动生成目录）----
+tools/.workbench-tests/
+tools/.mcp-project-*/
+tools/.native-*/
+tools/.qa-*/
+tools/.permission-*/
+tools/.bridge-live-test/
+tools/.snapshot-bounds-check/
+tools/.test-console-identity.json
+
+# 根目录用户状态（归档/置顶，本机运行态）
+/.console-state.json

@@ -1,0 +1,1 @@
+import fs from 'node:fs';const s=fs.readFileSync('D:/workbuddy/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs','utf8');for(const needle of ['function findProductJson()','ExternalLinkAuthenticationStorage','async restore(){','class External']){let i=s.indexOf(needle);if(i>=0)console.log(JSON.stringify({needle,context:s.slice(i-150,i+1500)}));}

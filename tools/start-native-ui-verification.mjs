@@ -1,0 +1,3 @@
+import fs from 'node:fs';import path from 'node:path';import {spawn} from 'node:child_process';
+const record=JSON.parse(fs.readFileSync('tools/native-service-results.json','utf8'));const root=record.root;const env={...process.env,CONSOLE_PORT:'7806',CONSOLE_DATA_HOME:root,CONSOLE_WORKBENCH_DIR:path.join(root,'worker'),CONSOLE_STATE_FILE:path.join(root,'console-state.json'),CONSOLE_IDENTITY_FILE:path.join(root,'identity.json')};delete env.CONSOLE_TEST_MODE;delete env.CONSOLE_TEST_ADAPTER;
+const server=spawn(process.execPath,['runtime/resources/app/server.mjs'],{env,windowsHide:true,stdio:'inherit'});server.on('exit',code=>process.exit(code||0));

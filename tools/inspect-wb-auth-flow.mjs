@@ -1,0 +1,2 @@
+import fs from 'node:fs';const s=fs.readFileSync('D:/workbuddy/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs','utf8');let offset=8635500;for(let n=0;n<7;n++){const i=s.indexOf('eP',offset+2);if(i<0)break;console.log(s.slice(Math.max(0,i-260),i+320));offset=i;}
+for(const needle of ['getAccountStatus(){','getAuthInfo','CodeBuddyExtension','authFileName']){const i=s.indexOf(needle);if(i>=0)console.log(JSON.stringify({needle,context:s.slice(i-220,i+400)}));}

@@ -1,0 +1,1 @@
+import fs from 'node:fs';const s=fs.readFileSync('D:/workbuddy/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs','utf8');for(const needle of ['static getHomeDir(){','createAuthCodec(t,i){','function createCredentialFieldCodec(']){const i=s.indexOf(needle);console.log(JSON.stringify({needle,context:i>=0?s.slice(i,i+1800):''}));}

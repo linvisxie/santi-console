@@ -1,0 +1,8 @@
+{
+  "name": "santi-console",
+  "productName": "三体控制台",
+  "version": "2.0.0",
+  "description": "Codex / WorkBuddy / dsh 三体控制台",
+  "main": "main.js",
+  "private": true
+}

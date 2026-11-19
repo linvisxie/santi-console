@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>三体控制台</title>
+<link rel="icon" type="image/png" href="./app-icon.png">
+<script>
+// 在样式表加载前确定渲染档位，避免闪烁。
+// full = 质感（默认）：完整玻璃模糊 + steps 跳变动画，实测 120fps
+// lite = 流畅：无动画无模糊，极限省电
+// 值做归一化：旧版本可能存成 JSON 带引号的 "full"，也要能认出来。
+(function () {
+  var v = null;
+  try {
+    v = localStorage.getItem('console-perf');
+  } catch (e) {}
+  try {
+    if (v) v = JSON.parse(v);
+  } catch (e) {}
+  document.documentElement.dataset.perf = v === 'lite' ? 'lite' : 'full';
+})();
+</script>
+<link rel="stylesheet" href="./app.css" />
+<link rel="stylesheet" href="./workbench.css" />
+<link rel="stylesheet" href="./liquid-glass.css" />
+<link rel="stylesheet" href="./visual-refinement.css" />
+</head>
+<body>
+<div class="liquid" aria-hidden="true"><span></span><span></span><span></span></div>
+<div class="grain" aria-hidden="true"></div>
+
+<div class="shell" id="shell" data-inspector="off">
+
+  <!-- 左：项目 / 会话 -->
+  <aside class="rail glass" id="rail">
+    <div class="rail-head">
+      <img class="mark app-mark" src="./app-icon.png" alt="" aria-hidden="true">
+      <div class="rail-title"><b>三体控制台</b><span>Codex · WorkBuddy · DSH</span></div>
+    </div>
+
+    <div class="sess-search">
+      <input id="sess-search" type="text" spellcheck="false" placeholder="搜索会话…" aria-label="搜索会话" />
+    </div>
+
+    <button class="new-btn" id="btn-new-project"><span>＋</span> 新建项目</button>
+    <div class="new-project-form" id="new-project-form" hidden>
+      <input id="new-project-input" type="text" spellcheck="false"
+             placeholder="项目绝对路径，如 D:\my-project" />
+    </div>
+
+    <div class="rail-label">
+      <span>代理 · 项目 · 会话</span>
+      <button class="rail-mini" id="btn-collapse-all" title="展开/收起所有项目的会话">全部收起</button>
+    </div>
+    <nav class="projects" id="projects" aria-label="项目列表"></nav>
+    <div class="rail-status" id="rail-status" hidden></div>
+
+    <div class="rail-foot">
+      <span class="quota-line" id="rail-quota">—</span>
+      <div class="rail-actions">
+        <button class="rail-btn" id="btn-settings"><i aria-hidden="true">⚙</i>设置</button>
+        <button class="rail-btn" id="btn-view-monitor"><i aria-hidden="true">▤</i>监控台</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- 中：对话 -->
+  <main class="main">
+    <header class="main-head">
+      <div class="head-left">
+        <h1 id="proj-name">选择项目</h1>
+        <div class="proj-path" id="proj-path">—</div>
+      </div>
+      <div class="head-right">
+        <span class="pill" id="run-state">待命</span>
+        <button class="icon-btn" id="btn-theme" title="切换明暗">☾</button>
+        <button class="icon-btn" id="btn-toggle-inspector" title="显示 / 收起右侧栏" aria-pressed="false">▥</button>
+      </div>
+    </header>
+
+    <div class="thread-bar" id="thread-bar" hidden>
+      <span class="tb-badge" id="tb-badge">CX</span>
+      <span class="tb-title" id="tb-title">历史会话</span>
+      <span class="tb-meta" id="tb-meta"></span>
+      <button class="tb-filter" id="btn-tb-export" title="导出当前会话为 Markdown">⬇ 导出</button>
+      <button class="tb-filter" id="btn-tb-filter" aria-pressed="true" title="隐藏工具调用与思考过程">只看对话</button>
+      <button class="tb-close" id="btn-thread-close" title="关闭回放，回到当前对话">×</button>
+    </div>
+
+    <div class="messages" id="messages">
+      <div class="empty" id="empty">
+        <h2>开始一段新的对话</h2>
+        <p>选一个项目，在下面写下任务。Codex 会在该项目里真执行，改动与预览会实时出现在右侧。</p>
+      </div>
+    </div>
+
+    <div class="composer-wrap">
+      <div class="attachments" id="attachments" hidden></div>
+      <div class="composer glass">
+        <textarea id="prompt" rows="1" placeholder="让 Codex 做什么？Enter 发送，Shift+Enter 换行"></textarea>
+        <div class="composer-bar">
+          <button class="round" id="btn-attach" title="上传图片 / 附件">＋</button>
+          <input type="file" id="file" multiple hidden />
+          <div class="dds" id="dds"></div>
+          <button class="chip" id="btn-mode" data-mode="read">只读</button>
+          <span class="spacer"></span>
+          <button class="chip ghost" id="btn-stop" hidden>停止</button>
+          <button class="send" id="btn-send" type="button">发送</button>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- 右：改动 / 预览 -->
+  <aside class="inspector glass" id="inspector">
+    <div class="insp-head">
+      <div class="seg" id="insp-tabs">
+        <button data-tab="changes" aria-pressed="true">改动</button>
+        <button data-tab="preview" aria-pressed="false">预览</button>
+      </div>
+      <div class="insp-actions"><button class="icon-btn" id="btn-refresh" title="刷新">⟳</button><button class="icon-btn" id="btn-close-inspector" title="关闭右侧栏" aria-label="关闭右侧栏">×</button></div>
+    </div>
+
+    <div class="insp-body" id="pane-changes">
+      <div class="changes-summary" id="changes-summary">—</div>
+      <div class="changes-list" id="changes-list"></div>
+    </div>
+
+    <div class="insp-body" id="pane-preview" hidden>
+      <form class="urlbar" id="urlbar">
+        <input id="preview-url" placeholder="http://localhost:5173" spellcheck="false" />
+        <button type="submit">打开</button>
+      </form>
+      <div class="preview-tips" id="preview-tips">输入本地服务地址后回车。目标站点若禁止被 iframe 嵌入（X-Frame-Options），需要用「新窗口打开」。</div>
+      <iframe id="preview-frame" title="预览" src="about:blank"></iframe>
+      <div class="preview-foot">
+        <button class="chip" id="btn-preview-reload">刷新页面</button>
+        <a class="chip" id="btn-preview-external" target="_blank" rel="noreferrer" href="about:blank">新窗口打开</a>
+      </div>
+    </div>
+  </aside>
+</div>
+
+<!-- 监控台：页内切换，不跳转 -->
+<section class="view-monitor" id="view-monitor" hidden aria-label="监控台">
+  <div class="view-bar glass">
+    <button class="back-btn" id="btn-view-back">返回工作台</button>
+    <button class="back-btn" id="btn-view-reload" title="重新加载监控台（卡住时点它）">重载</button>
+    <div class="view-title">监控台 <span>三体实时指标</span></div>
+    <span class="spacer"></span>
+  </div>
+  <iframe id="monitor-frame" title="监控台" src="about:blank"></iframe>
+</section>
+
+<!-- 设置面板 -->
+<div class="sheet-scrim" id="sheet-scrim" hidden></div>
+<section class="sheet glass" id="sheet" hidden aria-label="设置">
+  <header class="sheet-head">
+    <b>设置</b>
+    <button class="icon-btn" id="btn-sheet-close" title="关闭">✕</button>
+  </header>
+  <div class="sheet-body">
+    <div class="sheet-group">
+      <div class="sheet-label">外观</div>
+      <div class="seg wide" id="set-theme">
+        <button data-theme="light" aria-pressed="true">☀ 亮色</button>
+        <button data-theme="dark" aria-pressed="false">☾ 暗色</button>
+      </div>
+    </div>
+
+    <div class="sheet-group">
+      <div class="sheet-label">界面效果</div>
+      <div class="seg wide" id="set-perf">
+        <button data-perf="full" aria-pressed="true">质感（推荐）</button>
+        <button data-perf="lite" aria-pressed="false">流畅</button>
+      </div>
+      <p class="set-hint">质感：柔和透光、细腻边缘与轻量过渡。流畅：减少透明效果和动效，适合省电使用。</p>
+    </div>
+
+    <div class="sheet-group">
+      <div class="sheet-label">布局</div>
+      <label class="switch-row">
+        <span>右侧改动面板默认展开</span>
+        <input type="checkbox" id="set-inspector" />
+      </label>
+      <label class="switch-row">
+        <span>左侧默认展开全部项目</span>
+        <input type="checkbox" id="set-expand-all" />
+      </label>
+    </div>
+
+    <div class="sheet-group">
+      <details class="arch-fold">
+        <summary class="sheet-label">
+          <span>已归档会话</span>
+          <button class="rail-mini" id="btn-archive-refresh">刷新</button>
+        </summary>
+        <div class="archive-list" id="archive-list">
+          <p class="sheet-empty">还没有归档的会话。在左侧会话行点「归档」即可收起历史。</p>
+        </div>
+      </details>
+    </div>
+
+    <div class="sheet-group">
+      <details class="arch-fold">
+        <summary class="sheet-label">已隐藏项目</summary>
+        <div class="archive-list" id="hidden-project-list"></div>
+      </details>
+    </div>
+
+    <p class="sheet-note">
+      项目与会话来自三家真实落盘记录：Codex <code>sessions/**/rollout-*.jsonl</code>、
+      WorkBuddy <code>projects/&lt;slug&gt;/*.jsonl</code>、dsh <code>sessions/*/*/session.v4.jsonl.zstd</code>（逐帧解码）。
+    </p>
+  </div>
+</section>
+
+<script src="./app-ui.js"></script>
+<script src="./workbench-ui.js"></script>
+<script src="./file-workspace.js"></script>
+<script src="./automation-ui.js"></script>
+<script src="./glass-motion.js"></script>
+<script src="./window-controls.js"></script>
+<script src="./mcp-settings.js"></script>
+</body>
+</html>

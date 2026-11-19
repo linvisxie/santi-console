@@ -1,0 +1,1 @@
+import fs from 'node:fs';const s=fs.readFileSync('D:/workbuddy/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs','utf8');let n=0;for(const m of s.matchAll(/\.WT\b/g)){console.log(s.slice(m.index-260,m.index+180));if(++n>12)break;}

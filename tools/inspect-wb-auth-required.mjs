@@ -1,0 +1,1 @@
+import fs from 'node:fs';const s=fs.readFileSync('D:/workbuddy/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs','utf8');let off=-1;for(let n=0;n<14;n++){off=s.indexOf('AuthenticationRequiredError',off+1);if(off<0)break;console.log(s.slice(Math.max(0,off-220),off+200));}

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "santi-console": {
+      "url": "http://127.0.0.1:7790/mcp",
+      "headers": {"Authorization": "Bearer REPLACE_WITH_LOCAL_TOKEN"}
+    }
+  }
+}

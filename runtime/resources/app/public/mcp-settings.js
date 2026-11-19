@@ -1,0 +1,9 @@
+(()=>{
+  const body=document.querySelector('#sheet .sheet-body');if(!body)return;
+  const group=document.createElement('div');group.className='sheet-group';
+  group.innerHTML='<div class="sheet-label">MCP 控制与管理</div><p class="set-hint" id="mcp-status" role="status">正在读取状态…</p><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="rail-btn" data-mcp="start">启动 HTTP</button><button class="rail-btn" data-mcp="stop">停止 HTTP</button><button class="rail-btn" data-mcp="restart">重启</button><button class="rail-btn" data-mcp="status">刷新状态</button><button class="rail-btn" data-mcp="config">复制本机配置</button><button class="rail-btn" data-mcp="logs">查看日志</button></div><pre id="mcp-detail" hidden style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:220px;overflow:auto;font-size:12px"></pre><p class="set-hint">stdio 随 MCP 客户端启动。停止 HTTP 不会停止代理任务。远程连接尚未配置。</p>';
+  body.prepend(group);
+  async function act(action){const status=group.querySelector('#mcp-status'),detail=group.querySelector('#mcp-detail');group.querySelectorAll('button').forEach(b=>b.disabled=true);try{const r=await fetch('/api/mcp/manage',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})});const d=await r.json();if(!r.ok)throw Error(d.error||'操作失败');if(d.config){await navigator.clipboard.writeText(JSON.stringify(d.config,null,2));status.textContent='本机 MCP 配置已复制';}else if('logs'in d){detail.hidden=false;detail.textContent=d.logs;}else status.textContent=(d.online?'HTTP 服务可连接':'HTTP 服务未连接')+' · '+d.url;}catch(e){status.textContent=e.message;}finally{group.querySelectorAll('button').forEach(b=>b.disabled=false);}}
+  group.addEventListener('click',e=>{const b=e.target.closest('[data-mcp]');if(b)act(b.dataset.mcp);});
+  document.querySelector('#btn-settings')?.addEventListener('click',()=>act('status'));
+})();

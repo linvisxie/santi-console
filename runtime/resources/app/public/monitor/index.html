@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>三体控制台 · Codex / WorkBuddy / dsh</title>
+<script>
+// 同工作台：full 质感（默认）/ lite 流畅；值归一化兼容带引号的旧格式
+(function () {
+  var v = null;
+  try {
+    v = localStorage.getItem('console-perf');
+  } catch (e) {}
+  try {
+    if (v) v = JSON.parse(v);
+  } catch (e) {}
+  document.documentElement.dataset.perf = v === 'lite' ? 'lite' : 'full';
+})();
+</script>
+<link rel="stylesheet" href="./style.css" />
+<link rel="stylesheet" href="../visual-refinement.css" />
+</head>
+<body class="monitor-surface">
+<div class="liquid" aria-hidden="true"><span></span><span></span><span></span></div>
+<div class="grain" aria-hidden="true"></div>
+<div class="cursor-glow" id="cursor-glow" aria-hidden="true"></div>
+
+<div class="shell">
+  <header class="topbar">
+    <div class="brand">
+      <button class="back-link" id="btn-back" type="button" title="回到工作台">返回工作台</button>
+      <h1>三体<em>控制台</em></h1>
+      <div class="sub" id="subline">Codex · WorkBuddy · DSH 实时观察</div>
+    </div>
+
+    <div class="meta-strip">
+      <div class="stat"><b id="sum-running">—</b><span>进程在线</span></div>
+      <div class="stat"><b id="sum-busy">—</b><span>有执行证据</span></div>
+      <div class="stat"><b id="sum-mem">—</b><span>内存</span></div>
+      <div class="divider" aria-hidden="true"></div>
+      <div class="stat"><b id="sum-clock">—</b><span>本机时间</span></div>
+      <div class="controls">
+        <button class="chip" id="btn-live" aria-pressed="true" title="实时推送开关">实时</button>
+        <button class="chip" id="btn-theme" title="切换明暗">暗色</button>
+      </div>
+    </div>
+  </header>
+
+  <section class="stage" id="stage" aria-label="执行端状态"></section>
+
+  <div class="grid">
+    <section class="glass panel" aria-label="活动流">
+      <div class="panel-head">
+        <h3>实时流</h3>
+        <div class="feed-filter" id="feed-filter"></div>
+      </div>
+      <div class="feed" id="feed"></div>
+    </section>
+
+    <div class="side">
+      <section class="glass panel" aria-label="额度与用量">
+        <div class="panel-head">
+          <h3>额度</h3>
+          <span class="hint" id="quota-hint">—</span>
+        </div>
+        <div id="quota"></div>
+        <div class="bridges-wrap">
+          <div class="bridges" id="bridges"></div>
+          <div class="probe-line">
+            <button class="chip" id="btn-probe">探测当前</button>
+            <span class="probe-out" id="probe-out">选中执行端后探测（不消耗额度）</span>
+          </div>
+        </div>
+      </section>
+
+
+      <section class="glass panel" aria-label="配置状态">
+        <div class="panel-head">
+          <h3>配置</h3>
+          <span class="hint" id="cfg-hint">—</span>
+        </div>
+        <div class="tabs" id="tabs"></div>
+        <div id="cfg"></div>
+        <div class="cfg-path" id="cfg-path"></div>
+      </section>
+    </div>
+  </div>
+
+  <footer class="foot">
+    <span id="foot-host">—</span>
+    <span id="foot-ts">—</span>
+  </footer>
+</div>
+
+<script src="./app.js"></script>
+<script src="../glass-motion.js"></script>
+</body>
+</html>

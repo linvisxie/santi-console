@@ -1,0 +1,1 @@
+import fs from 'node:fs';const s=fs.readFileSync('D:/workbuddy/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs','utf8');const m=s.match(/kC=n\((\d+)\)/);console.log(m?.[0]);if(m){const start=s.indexOf(m[1]+'(t,i,n){');console.log(s.slice(start,start+5500));}

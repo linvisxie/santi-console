@@ -1,0 +1,7 @@
+# Overlay for the shipped `headless` profile: switch the default route from the
+# API-key provider (deepseek-official, requires DEEPSEEK_API_KEY) to the signed-in
+# DeepSeek account route (deepseek-account), which the headless profile already mounts.
+- id: agent-default-model
+  config:
+    provider: deepseek-account
+    model: deepseek-flash

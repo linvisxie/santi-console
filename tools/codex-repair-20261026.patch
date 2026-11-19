@@ -1,0 +1,1412 @@
+--- before/server.mjs
++++ after/server.mjs
+@@ -21,8 +21,11 @@
+ import crypto from 'node:crypto';
+ import { spawn, execFileSync } from 'node:child_process';
+ import { fileURLToPath } from 'node:url';
++import { createInterface } from 'node:readline';
++import { DatabaseSync } from 'node:sqlite';
+ 
+ const HERE = path.dirname(fileURLToPath(import.meta.url));
++const SERVER_REVISION = crypto.createHash('sha256').update(fs.readFileSync(fileURLToPath(import.meta.url))).digest('hex').slice(0, 16);
+ const PUBLIC_DIR = path.join(HERE, 'public');
+ const PORT = Number(process.env.CONSOLE_PORT || 7788);
+ 
+@@ -51,12 +54,28 @@
+ }
+ 
+ const P = {
+-  codexHome: path.join(HOME, '.codex'),
+-  wbHome: path.join(HOME, '.workbuddy'),
+-  dshHome: path.join(HOME, '.dsh'),
++  codexHome: path.join(process.env.CONSOLE_DATA_HOME || HOME, '.codex'),
++  wbHome: path.join(process.env.CONSOLE_DATA_HOME || HOME, '.workbuddy'),
++  dshHome: path.join(process.env.CONSOLE_DATA_HOME || HOME, '.dsh'),
+   wbBridge: resolveBridgeDir('wb-bridge'),
+   dshBridge: resolveBridgeDir('dsh-bridge'),
+ };
++
++const cleanPath = (value) => String(value || '').replace(/^\\\\\?\\/, '');
++const pathKey = (value) => path.resolve(cleanPath(value)).replace(/[\\/]+$/, '').toLowerCase();
++const samePath = (a, b) => !!a && !!b && pathKey(a) === pathKey(b);
++
++function readDatabase(file, query) {
++  let db;
++  try { db = new DatabaseSync(file, { readOnly: true }); return db.prepare(query).all(); }
++  catch { return []; }
++  finally { db?.close(); }
++}
++
++function codexMetadata() {
++  return readDatabase(path.join(P.codexHome, 'state_5.sqlite'),
++    'SELECT id, cwd, title, first_user_message, archived, is_pinned FROM threads');
++}
+ 
+ const now = () => Date.now();
+ const safe = (fn, fallback = null) => {
+@@ -465,26 +484,22 @@
+  * ================================================================== */
+ 
+ function codexRollouts() {
+-  const base = path.join(P.codexHome, 'sessions');
+   const files = [];
+-  for (const y of listDir(base)) {
+-    for (const m of listDir(path.join(base, y))) {
+-      for (const d of listDir(path.join(base, y, m))) {
+-        const dir = path.join(base, y, m, d);
+-        for (const f of listDir(dir)) {
+-          if (!f.endsWith('.jsonl')) continue;
+-          const full = path.join(dir, f);
+-          const t = mtime(full);
+-          if (t) files.push({ file: full, mtime: t });
+-        }
+-      }
+-    }
++  for (const base of [path.join(P.codexHome, 'sessions'), path.join(P.codexHome, 'archived_sessions')]) {
++  const walk = (dir) => {
++    for (const entry of safe(() => fs.readdirSync(dir, { withFileTypes: true }), [])) {
++      const full = path.join(dir, entry.name);
++      if (entry.isDirectory()) walk(full);
++      else if (/\.jsonl(?:\.zst)?$/.test(entry.name)) files.push({ file: full, mtime: mtime(full) });
++    }
++  };
++  walk(base);
+   }
+   return files.sort((a, b) => b.mtime - a.mtime);
+ }
+ 
+ function codexSessionMeta(file) {
+-  const head = safe(() => readHeadText(file, 24_000), '');
++  const head = safe(() => readReplayHead(file, 24_000), '');
+   for (const line of head.split(/\r?\n/)) {
+     if (!line.trim()) continue;
+     try {
+@@ -520,7 +535,7 @@
+     if (p.type === 'item_completed' && p.item) {
+       const it = p.item;
+       const t = String(it.type || '');
+-      const body = (it.content || [])
++      const body = contentBlocks(it.content)
+         .filter((c) => c && typeof c.text === 'string')
+         .map((c) => c.text)
+         .join(' ');
+@@ -531,7 +546,7 @@
+       if (/usermessage/i.test(t)) {
+         const ask = extractAsk(body);
+         if (!ask.trim() || SYS_MSG.test(ask)) return null;
+-        const imgs = (it.content || [])
++        const imgs = contentBlocks(it.content)
+           .filter((c) => c && c.type === 'input_image' && typeof c.image_url === 'string' && c.image_url.startsWith('data:'))
+           .map((c, i) => ({ name: `image-${i + 1}`, isImage: true, dataUrl: c.image_url }));
+         return { ts, kind: 'ask', text: cut(ask, 220), meta: '', atts: imgs.length ? imgs : undefined };
+@@ -544,16 +559,19 @@
+     return null;
+   }
+   if (j.type === 'response_item') {
++    if (p.type === 'custom_tool_call') return { ts, kind: 'tool', text: p.name || 'tool', meta: toolDetail(p.input), files: [...String(p.input || '').matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm)].map((m) => m[1].trim()) };
+     if (p.type === 'function_call') return { ts, kind: 'tool', text: short(p.name || 'tool', 60), meta: toolDetail(p.arguments), file: filePathOf(p.arguments) };
+     if (p.type === 'message') {
+       // system / developer 是 Codex 自己注入的提示词，不算对话
+       if (p.role !== 'user' && p.role !== 'assistant') return null;
+-      const body = (p.content || [])
++      const rawBody = contentBlocks(p.content)
+         .filter((c) => c && (c.type === 'output_text' || c.type === 'input_text' || c.type === 'text'))
+         .map((c) => c.text || '')
+         .join(' ');
++      const body = p.role === 'user' ? extractAsk(rawBody) : rawBody;
+       if (!body.trim() || SYS_MSG.test(body)) return null;
+-      return { ts, kind: p.role === 'user' ? 'ask' : 'done', text: cut(body, 260), meta: '' };
++      const atts = contentBlocks(p.content).filter((c) => c.type === 'input_image' && typeof c.image_url === 'string').map((c) => ({ isImage: true, dataUrl: c.image_url }));
++      return { atts, ts, kind: p.role === 'user' ? 'ask' : 'done', text: cut(body, 260), meta: '' };
+     }
+   }
+   return null;
+@@ -693,7 +711,7 @@
+   }
+   const ts = typeof j.timestamp === 'number' ? j.timestamp : Date.parse(j.timestamp) || now();
+   if (j.type === 'message') {
+-    const raw = (j.content || [])
++    const raw = contentBlocks(j.content)
+       .filter((c) => c && (c.type === 'output_text' || c.type === 'text' || c.type === 'input_text'))
+       .map((c) => c.text || '')
+       .join(' ');
+@@ -701,7 +719,8 @@
+     // 用户提问被包在 system-reminder 里，真句在 <user_query> 内
+     const body = j.role === 'user' ? extractAsk(raw) : raw;
+     if (!body.trim() || SYS_MSG.test(body)) return null;
+-    return { ts, kind: j.role === 'user' ? 'ask' : 'done', text: short(body, j.role === 'user' ? 220 : 260), meta: '' };
++    if (j.role !== 'user' && j.role !== 'assistant') return null;
++    return { ts, kind: j.role === 'user' ? 'ask' : 'done', text: full ? body : short(body, j.role === 'user' ? 220 : 260), meta: '' };
+   }
+   if (j.type === 'function_call') {
+     return { ts, kind: 'tool', text: short(j.name || 'tool', 48), meta: toolDetail(j.arguments || j.input), file: filePathOf(j.arguments || j.input) };
+@@ -887,7 +906,7 @@
+   while (off < buf.length - 2 && total < maxOut) {
+     const end = endOf(off);
+     if (end <= off) break;
+-    const hasMagic = buf.readUInt32LE(off) === MAGIC;
++    const hasMagic = off + 4 <= buf.length && buf.readUInt32LE(off) === MAGIC;
+     const slice = hasMagic
+       ? buf.subarray(off, end)
+       : Buffer.concat([MAGIC_BUF, buf.subarray(off, end)]);
+@@ -907,7 +926,7 @@
+ function dshSessionLines(file, maxOut = 2 << 20) {
+   return safe(() => {
+     const size = fileSize(file);
+-    const buf = size > 6 << 20 ? fs.readFileSync(file).subarray(0, 6 << 20) : fs.readFileSync(file);
++    const buf = fs.readFileSync(file);
+     const frames = zstdFrames(buf, maxOut);
+     if (!frames.length) return [];
+     return Buffer.concat(frames).toString('utf8').split(/\r?\n/).filter((l) => l.trim());
+@@ -923,11 +942,15 @@
+   if (hit && hit.mtime === mt) return hit.data;
+   const data = build();
+   SESSION_CACHE.set(file, { mtime: mt, data });
+-  if (SESSION_CACHE.size > 400) SESSION_CACHE.delete(SESSION_CACHE.keys().next().value);
++  if (SESSION_CACHE.size > 10000) SESSION_CACHE.delete(SESSION_CACHE.keys().next().value);
+   return data;
+ }
+ 
+ /** WorkBuddy/Codex 会把用户提问包在 system-reminder 里，真正的问句在 <user_query> 标签内 */
++function contentBlocks(content) {
++  return Array.isArray(content) ? content : typeof content === 'string' ? [{ type: 'text', text: content }] : [];
++}
++
+ function extractAsk(raw) {
+   const t = String(raw || '');
+   const m = t.match(/<user_query>([\s\S]*?)<\/user_query>/i);
+@@ -948,8 +971,13 @@
+ }
+ 
+ function codexSessionTitle(file) {
+-  const head = safe(() => readHeadText(file, 220_000), '');
++  const head = safe(() => readReplayHead(file, 220_000), '');
+   return firstAskText(head);
++}
++
++function readReplayHead(file, max) {
++  if (!file.endsWith('.zst')) return readHeadText(file, max);
++  return Buffer.concat(zstdFrames(fs.readFileSync(file), max)).toString('utf8').slice(0, max);
+ }
+ 
+ function wbSessionMeta(file) {
+@@ -967,7 +995,7 @@
+     }
+     if (!cwd && typeof j.cwd === 'string') cwd = j.cwd;
+     if (!title && j.type === 'message' && j.role === 'user') {
+-      const t = (j.content || [])
++      const t = contentBlocks(j.content)
+         .filter((c) => c && typeof c.text === 'string')
+         .map((c) => c.text)
+         .join(' ')
+@@ -1036,24 +1064,30 @@
+ /** [{ id, agent, cwd, title, ts, file }]，按时间倒序 */
+ function collectSessions() {
+   const out = [];
+-  const __st = readConsoleState();
+-
+-  for (const r of codexRollouts().slice(0, 300)) {
++  const native = new Map(codexMetadata().map((row) => [row.id, row]));
++  
++
++  for (const r of codexRollouts()) {
+     const data = cachedSession(r.file, r.mtime, () => {
+-      const meta = codexSessionMeta(r.file) || {};
++      const nativeId = path.basename(r.file).replace(/\.jsonl(?:\.zst)?$/, '').match(/[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i)?.[0];
++      const row = native.get(nativeId);
++      const meta = row || codexSessionMeta(r.file) || {};
+       return {
+-        id: `codex:${path.basename(r.file, '.jsonl')}`,
++        id: `codex:${path.basename(r.file).replace(/\.jsonl(?:\.zst)?$/, '')}`,
+         agent: 'codex',
+-        cwd: meta.cwd || '',
+-        title: codexSessionTitle(r.file) || '',
++        cwd: cleanPath(meta.cwd),
++        title: row?.title || row?.first_user_message || codexSessionTitle(r.file) || '',
++        nativeArchived: !!row?.archived,
+         ts: r.mtime,
+         file: r.file,
+       };
+     });
+-    out.push(data);
+-  }
+-
+-  for (const r of wbTranscriptFiles(40)) {
++    const nativeId = data.id.match(/[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i)?.[0];
++    const row = native.get(nativeId);
++    out.push(row ? { ...data, cwd: cleanPath(row.cwd) || data.cwd, title: row.title || data.title, nativeArchived: !!row.archived } : data);
++  }
++
++  for (const r of wbTranscriptFiles(Infinity)) {
+     const data = cachedSession(r.file, r.mtime, () => {
+       const meta = wbSessionMeta(r.file);
+       return {
+@@ -1068,7 +1102,7 @@
+     out.push(data);
+   }
+ 
+-  for (const s of dshSessions(30)) {
++  for (const s of dshSessions(Infinity)) {
+     const data = cachedSession(s.file, s.mtime, () => {
+       const meta = dshSessionMeta(s.file);
+       const h = meta.header || {};
+@@ -1085,12 +1119,12 @@
+     out.push(data);
+   }
+ 
+-  return out.sort((a, b) => b.ts - a.ts);
++  return [...new Map(out.map((s) => [s.id, { ...s, cwd: s.cwd ? path.normalize(cleanPath(s.cwd)) : '' }])).values()].sort((a, b) => b.ts - a.ts);
+ }
+ 
+ /* ---------------- 归档 / 置顶（写在本目录的 .console-state.json） ---------------- */
+ 
+-const STATE_FILE = path.join(HERE, '.console-state.json');
++const STATE_FILE = process.env.CONSOLE_STATE_FILE || path.join(HERE, '.console-state.json');
+ 
+ function readConsoleState() {
+   const j = safe(() => JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')), {});
+@@ -1104,7 +1138,10 @@
+ }
+ 
+ function writeConsoleState(next) {
+-  safe(() => fs.writeFileSync(STATE_FILE, JSON.stringify(next, null, 2), 'utf8'));
++  const temp = STATE_FILE + '.tmp';
++  fs.writeFileSync(temp, JSON.stringify(next, null, 2), 'utf8');
++  fs.renameSync(temp, STATE_FILE);
++  invalidateProjects();
+   return next;
+ }
+ 
+@@ -1359,7 +1396,9 @@
+ function startChat({ prompt, cwd, mode, agent = 'codex', model, effort, attachments = [] }) {
+   if (activeRun) throw new Error('上一次执行还没结束，先停止它再来一轮。');
+ 
+-  const workdir = cwd && exists(cwd) ? cwd : process.cwd();
++  if (!cwd || !path.isAbsolute(cleanPath(cwd)) || !isDir(cwd))
++    throw new Error('项目目录不存在或不可访问，请先恢复目录或选择其他项目。');
++  const workdir = cwd;
+   const runId = `run-${Date.now().toString(36)}`;
+   const startedAt = now();
+   const files = (attachments || []).filter((a) => typeof a === 'string' && a.trim());
+@@ -1618,39 +1657,25 @@
+   return out;
+ }
+ 
+-/** 小文件全量读；大文件读「头部 + 尾部」，中间用占位说明省略了多少 */
+-function readSessionParts(file) {
+-  const MAX = 9 << 20;
+-  const size = fileSize(file);
+-  if (size <= MAX) {
+-    return { head: safe(() => fs.readFileSync(file, 'utf8'), ''), tail: '', omitted: 0, size };
+-  }
+-  const headLen = 3 << 20;
+-  const tailLen = 4 << 20;
+-  return {
+-    head: safe(() => readHeadText(file, headLen), ''),
+-    tail: safe(() => readText(file, tailLen), ''),
+-    omitted: Math.max(0, size - headLen - tailLen),
+-    size,
+-  };
+-}
+-
+-function mergeParts(headItems, tailItems, omitted, limit) {
+-  if (!omitted) return [...headItems, ...tailItems].slice(-limit);
+-  const half = Math.max(1, Math.floor(limit / 2));
+-  return [
+-    ...headItems.slice(0, half),
+-    { role: 'gap', text: `中间省略 ${(omitted / 1048576).toFixed(1)} MB`, ts: 0 },
+-    ...tailItems.slice(-half),
+-  ];
+-}
+-
+-function codexMessages(file, limit) {
+-  const parts = readSessionParts(file);
+-
+-  const collect = (text) => {
++async function* sessionRecords(file) {
++  const source = fs.createReadStream(file);
++  const input = file.endsWith('.zst') ? source.pipe(zlib.createZstdDecompress()) : source;
++  if (input !== source) source.on('error', (error) => input.destroy(error));
++  input.setEncoding('utf8');
++  const lines = createInterface({ input, crlfDelay: Infinity });
++  try {
++    for await (const line of lines) {
++      if (!line.trim()) continue;
++      try { yield JSON.parse(line); } catch { /* 忽略正在写入的半条记录 */ }
++    }
++  } finally { lines.close(); input.destroy(); source.destroy(); }
++}
++
++async function codexMessages(file, limit) {
++
++  const collect = async (records) => {
+     const items = [];
+-    for (const j of parseJsonLines(text)) {
++    for await (const j of records) {
+       const ts = Date.parse(j.timestamp) || 0;
+       // token_count：回合级用量（暂存，稍后合并进前面最近的 assistant 消息）
+       if (j.type === 'event_msg' && j.payload && j.payload.type === 'token_count') {
+@@ -1669,7 +1694,7 @@
+       } else if (it.kind === 'done') {
+         items.push({ role: 'assistant', text: it.text, ts });
+       } else {
+-        items.push({ role: 'tool', text: it.text, meta: it.meta, file: it.file || filePathOf(it.metaRaw ?? it.meta), ts });
++        items.push({ role: 'tool', text: it.text, meta: it.meta, files: it.files, file: it.file || filePathOf(it.metaRaw ?? it.meta), ts });
+       }
+     }
+     // 用量行合并进前面最近的 assistant（作为消息底部小字，不独立成行 ——
+@@ -1704,17 +1729,14 @@
+     return out;
+   };
+ 
+-  const headItems = collect(parts.head);
+-  const tailItems = parts.omitted ? collect(parts.tail) : [];
+-  return mergeParts(headItems, tailItems, parts.omitted, limit);
+-}
+-
+-function wbMessages(file, limit) {
+-  const parts = readSessionParts(file);
+-
+-  const collect = (text) => {
++  return collect(sessionRecords(file));
++}
++
++async function wbMessages(file, limit) {
++
++  const collect = async (records) => {
+     const items = [];
+-    for (const j of parseJsonLines(text)) {
++    for await (const j of records) {
+       const ts = typeof j.timestamp === 'number' ? j.timestamp : Date.parse(j.timestamp) || 0;
+       const it = wbLineToItem(JSON.stringify(j), true);
+       if (!it) continue;
+@@ -1737,13 +1759,11 @@
+     return out;
+   };
+ 
+-  const headItems = collect(parts.head);
+-  const tailItems = parts.omitted ? collect(parts.tail) : [];
+-  return mergeParts(headItems, tailItems, parts.omitted, limit);
++  return collect(sessionRecords(file));
+ }
+ 
+ function dshMessages(file, limit) {
+-  const lines = dshSessionLines(file, 6 << 20);
++  const lines = dshSessionLines(file, Infinity);
+   const items = [];
+   for (const j of parseJsonLines(lines.join('\n'))) {
+     // dsh 行的时间字段可能是 ISO 字符串或毫秒数字，统一转毫秒
+@@ -1770,7 +1790,7 @@
+         .map((c) => c.text)
+         .join('\n')
+         .trim();
+-      if (think) items.push({ role: 'reasoning', text: short(think, 1200), ts });
++      if (think) items.push({ role: 'reasoning', text: think, ts });
+     } else if (j.type === 'tool/call') {
+       items.push({
+         role: 'tool',
+@@ -1792,21 +1812,37 @@
+   return out.slice(-limit);
+ }
+ 
+-function sessionDetail(id) {
++const DETAIL_CACHE = new Map();
++async function sessionDetail(id) {
++  const session = sessionIndex().get(id);
++  if (!session) throw new Error('找不到这条会话，刷新列表再来');
++  const stat = fs.statSync(session.file);
++  const fingerprint = `${stat.mtimeMs}:${stat.size}`;
++  const hit = DETAIL_CACHE.get(id);
++  if (hit?.fingerprint === fingerprint) return hit.promise;
++  const promise = buildSessionDetail(id);
++  DETAIL_CACHE.set(id, { fingerprint, promise });
++  while (DETAIL_CACHE.size > 3) DETAIL_CACHE.delete(DETAIL_CACHE.keys().next().value);
++  try { return await promise; } catch (error) { if (DETAIL_CACHE.get(id)?.promise === promise) DETAIL_CACHE.delete(id); throw error; }
++}
++
++async function buildSessionDetail(id) {
+   const s = sessionIndex().get(id);
+   if (!s) throw new Error('找不到这条会话，可能已被清理，刷新列表再来');
+-  const limit = 600;
++  const limit = Infinity;
+   const messages =
+-    s.agent === 'codex' ? codexMessages(s.file, limit) : s.agent === 'workbuddy' ? wbMessages(s.file, limit) : dshMessages(s.file, limit);
+-  const meta = readSessionParts(s.file);
++    await (s.agent === 'codex' ? codexMessages(s.file, limit) : s.agent === 'workbuddy' ? wbMessages(s.file, limit) : dshMessages(s.file, limit));
++  const meta = { size: fileSize(s.file), omitted: 0 };
+   // 产物文件：工具调用里出现过的绝对路径（Write/Edit 等按出现顺序聚合）
+   const files = [];
+   const seen = new Set();
+   for (const m of messages) {
+-    if (m.role !== 'tool' || !m.file) continue;
+-    if (seen.has(m.file)) continue;
+-    seen.add(m.file);
+-    files.push(m.file);
++    if (m.role !== 'tool') continue;
++    for (const f of [m.file, ...(m.files || [])].filter(Boolean)) {
++      const full = path.resolve(s.cwd || HERE, f);
++      if (seen.has(pathKey(full))) continue;
++      seen.add(pathKey(full)); files.push(full);
++    }
+   }
+   return {
+     id,
+@@ -1830,7 +1866,15 @@
+ function isRepoCached(root) {
+   const hit = GIT_REPO_CACHE.get(root);
+   if (hit && now() - hit.at < 10 * 60_000) return hit.v;
+-  const v = safe(() => gitOut(['rev-parse', '--is-inside-work-tree'], root)?.trim() === 'true', false);
++  const v = safe(() => {
++    let dir = path.resolve(root);
++    while (true) {
++      if (exists(path.join(dir, '.git'))) return true;
++      const parent = path.dirname(dir);
++      if (parent === dir) return false;
++      dir = parent;
++    }
++  }, false);
+   GIT_REPO_CACHE.set(root, { at: now(), v });
+   return v;
+ }
+@@ -1856,8 +1900,7 @@
+     if (!cwd || cwd === '—') return false;
+     if (JUNK.test(cwd) || JUNK.test(path.basename(cwd))) return false;
+     if (/[\\/]\.(dsh|codex|workbuddy|codebuddy)[\\/]/i.test(cwd + path.sep)) return false;
+-    if (cwd.replace(/[\\/]+$/, '').toLowerCase() === HOME.toLowerCase()) return false;
+-    return exists(cwd);
++    return path.isAbsolute(cwd) && !state.hiddenProjects.some((p) => samePath(p, cwd));
+   };
+ 
+   const label = (dir) => {
+@@ -1873,15 +1916,15 @@
+     if (!usable(s.cwd)) continue;
+     const bucket = buckets.get(s.agent);
+     if (!bucket) continue;
+-    const key = s.cwd.toLowerCase();
++    const key = pathKey(s.cwd);
+     const cur = bucket.get(key) || { path: s.cwd, sessions: [], mtime: 0 };
+     cur.sessions.push({
+       id: s.id,
+       agent: s.agent,
+-      title: s.title ? short(s.title, 46) : `会话 ${String(s.id).split(':').pop().slice(-6)}`,
++      title: state.aliases?.sessions?.[s.id] || (s.title ? short(s.title, 46) : `会话 ${String(s.id).split(':').pop().slice(-6)}`),
+       ts: s.ts,
+-      archived: !!(state.archived && state.archived[s.id]),
+-      pinned: !!s.pinned,
++      archived: s.id in state.archived ? !!state.archived[s.id] : !!s.nativeArchived || s.file.includes(path.sep + 'archived_sessions' + path.sep),
++      pinned: state.pinnedSessions.includes(s.id),
+     });
+     cur.mtime = Math.max(cur.mtime, s.ts);
+     bucket.set(key, cur);
+@@ -1889,10 +1932,19 @@
+ 
+   for (const pinned of state.pinned) {
+     if (!usable(pinned)) continue;
+-    const key = pinned.toLowerCase();
++    const key = pathKey(pinned);
+     // 手动新建的项目挂到 WorkBuddy（控制台本身跑在 WorkBuddy 里）
+     const bucket = buckets.get('workbuddy');
+     if (!bucket.has(key)) bucket.set(key, { path: pinned, sessions: [], mtime: mtime(pinned) });
++  }
++
++  for (const root of readDatabase(path.join(P.codexHome, 'state_5.sqlite'),
++    'SELECT p.name, r.path FROM projects p JOIN project_roots r ON p.id = r.project_id')) {
++    const cwd = path.normalize(cleanPath(root.path));
++    if (!usable(cwd)) continue;
++    const bucket = buckets.get('codex'); const key = pathKey(cwd);
++    const item = bucket.get(key) || { path: cwd, sessions: [], mtime: 0 };
++    item.nativeName = root.name; item.explicit = true; bucket.set(key, item);
+   }
+ 
+   const agents = AGENT_META.map((meta) => {
+@@ -1903,8 +1955,9 @@
+         const active = sessions.filter((x) => !x.archived);
+         return {
+           agent: meta.id,
++          explicit: !!v.explicit,
+           path: v.path,
+-          name: path.basename(v.path) || v.path,
++          name: state.aliases?.projects?.[v.path] || v.nativeName || (samePath(v.path, HOME) ? '家目录' : path.basename(v.path)) || v.path,
+           group: path.dirname(v.path),
+           groupLabel: label(path.dirname(v.path)),
+           sessions,
+@@ -1915,7 +1968,7 @@
+           isRepo: isRepoCached(v.path),
+         };
+       })
+-      .filter((p) => p.sessionCount > 0 || state.pinned.some((x) => x.toLowerCase() === p.path.toLowerCase()))
++      .filter((p) => p.activeCount > 0 || (p.sessionCount === 0 && (p.explicit || state.pinned.some((x) => samePath(x, p.path)))))
+       .sort((a, b) => b.mtime - a.mtime);
+ 
+     return {
+@@ -1938,7 +1991,7 @@
+     }
+   }
+ 
+-  return { agents, projects: flat, archived: archivedSessions() };
++  return { agents, projects: flat, archived: archivedSessions(), hiddenProjects: [...new Set(state.hiddenProjects.map((p) => path.normalize(p)))] };
+ }
+ 
+ function projectCandidatesCached() {
+@@ -1949,80 +2002,15 @@
+   return data;
+ }
+ 
+-function projectCandidates() {
+-  const state = readConsoleState();
+-  const JUNK = /(?:\\AppData\\Local\\Temp\\|__workbuddy_cli_host__|\\codex-probe$|^__)/i;
+-  const map = new Map();
+-
+-  const usable = (cwd) => {
+-    if (!cwd || cwd === '—') return false;
+-    if (JUNK.test(cwd) || JUNK.test(path.basename(cwd))) return false;
+-    if (cwd.replace(/[\\/]+$/, '').toLowerCase() === HOME.toLowerCase()) return false;
+-    if (/[\\/]\.(dsh|codex|workbuddy|codebuddy)[\\/]/i.test(cwd + path.sep)) return false;
+-    if (!exists(cwd)) return false;
+-    return true;
+-  };
+-
+-  for (const s of collectSessions()) {
+-    if (!usable(s.cwd)) continue;
+-    const key = s.cwd.toLowerCase();
+-    const cur = map.get(key) || { path: s.cwd, sessions: [], agents: new Set() };
+-    cur.agents.add(s.agent);
+-    cur.sessions.push({
+-      id: s.id,
+-      agent: s.agent,
+-      title: s.title ? short(s.title, 46) : `会话 ${String(s.id).split(':').pop().slice(-6)}`,
+-      ts: s.ts,
+-      archived: !!(state.archived && state.archived[s.id]),
+-      pinned: !!s.pinned,
+-    });
+-    map.set(key, cur);
+-  }
+-
+-  // 手动新建 / 曾在控制台里选过的项目，即使没有会话也要留着
+-  for (const pinned of state.pinned) {
+-    if (!usable(pinned)) continue;
+-    const key = pinned.toLowerCase();
+-    if (!map.has(key)) map.set(key, { path: pinned, sessions: [], agents: new Set() });
+-  }
+-
+-  return [...map.values()]
+-    .map((v) => {
+-      const sessions = v.sessions.sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.ts - a.ts);
+-      const active = sessions.filter((x) => !x.archived);
+-      return {
+-        path: v.path,
+-        name: path.basename(v.path) || v.path,
+-        group: path.dirname(v.path),
+-        groupLabel: (() => {
+-          const dir = path.dirname(v.path);
+-          const lower = dir.toLowerCase();
+-          if (lower === HOME.toLowerCase()) return '~ 家目录';
+-          if (lower.startsWith(HOME.toLowerCase() + path.sep)) return '~' + dir.slice(HOME.length);
+-          return dir;
+-        })(),
+-        agents: [...v.agents],
+-        sessionCount: sessions.length,
+-        activeCount: active.length,
+-        archivedCount: sessions.length - active.length,
+-        sessions,
+-        mtime: sessions.length ? sessions[0].ts : mtime(v.path),
+-        isRepo: isRepoCached(v.path),
+-      };
+-    })
+-    .sort((a, b) => b.mtime - a.mtime);
+-}
+-
+ function archivedSessions() {
+   const state = readConsoleState();
+-  const ids = Object.keys(state.archived || {});
+-  if (!ids.length) return [];
+   const all = new Map(collectSessions().map((s) => [s.id, s]));
++  const ids = [...new Set([...Object.keys(state.archived || {}), ...[...all.values()].filter((s) => (s.nativeArchived || s.file.includes(path.sep + 'archived_sessions' + path.sep))).map((s) => s.id)])].filter((id) => state.archived[id] !== false);
+   return ids
+     .map((id) => {
+       const s = all.get(id);
+       return s
+-        ? { id, agent: s.agent, title: s.title ? short(s.title, 60) : '', cwd: s.cwd, ts: s.ts, archivedAt: state.archived[id] }
++        ? { id, agent: s.agent, title: s.title ? short(s.title, 60) : '', cwd: s.cwd, ts: s.ts, archivedAt: Number(state.archived[id]) > 1 ? state.archived[id] : s.ts }
+         : { id, agent: 'unknown', title: '', cwd: '', ts: state.archived[id], archivedAt: state.archived[id], missing: true };
+     })
+     .sort((a, b) => b.archivedAt - a.archivedAt);
+@@ -2347,8 +2335,7 @@
+       null,
+     );
+     const list = (cat && cat.entries ? cat.entries : [])
+-      .filter((e) => /Flash|Max|GLM|Kimi|MiniMax|DeepSeek/i.test(e.id || ''))
+-      .slice(0, 12)
++      .filter((e) => typeof e.id === 'string' && e.id)
+       .map((e) => ({ id: e.id, name: e.name || e.id }));
+     const def = dshProfiles().find((x) => x.name === 'delegate');
+     if (def) {
+@@ -2364,7 +2351,7 @@
+   };
+   push(cfg.model, cfg.model ? `${cfg.model}（当前）` : null);
+   const arr = Array.isArray(cache) ? cache : cache && Array.isArray(cache.models) ? cache.models : [];
+-  for (const m of arr.slice(0, 24)) {
++  for (const m of arr) {
+     const id = m.slug || m.id || m.model;
+     if (id) push(id, m.display_name || m.name || id);
+   }
+@@ -2403,6 +2390,7 @@
+ }
+ 
+ const server = http.createServer(async (req, res) => {
++  try {
+   const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
+ 
+   if (url.pathname === '/api/state') return sendJson(res, 200, buildState(true));
+@@ -2414,6 +2402,7 @@
+       parentPid: PARENT_PID,
+       port: PORT,
+       appDir: HERE,
++      revision: SERVER_REVISION,
+       startedAt: IDENTITY_STARTED,
+       bridges: { wb: P.wbBridge, dsh: P.dshBridge },
+     });
+@@ -2473,11 +2462,13 @@
+       try {
+         if (!exists(target)) fs.mkdirSync(target, { recursive: true });
+         const state = readConsoleState();
++        state.hiddenProjects = state.hiddenProjects.filter((p) => !samePath(p, target));
+         if (!state.pinned.some((x) => x.toLowerCase() === target.toLowerCase())) {
+           state.pinned.push(target);
+           writeConsoleState(state);
+           invalidateProjects();
+         }
++        writeConsoleState(state);
+         return sendJson(res, 200, { ok: true, path: target, created: true });
+       } catch (e) {
+         return sendJson(res, 500, { error: String(e.message || e) });
+@@ -2492,7 +2483,7 @@
+ 
+   if (url.pathname === '/api/session') {
+     try {
+-      return sendJson(res, 200, sessionDetail(url.searchParams.get('id') || ''));
++      return sendJson(res, 200, await sessionDetail(url.searchParams.get('id') || ''));
+     } catch (e) {
+       return sendJson(res, 404, { error: String(e.message || e) });
+     }
+@@ -2539,14 +2530,12 @@
+     if (!st.archived || typeof st.archived !== 'object') st.archived = {};
+     let count = 0;
+     for (const s2 of collectSessions()) {
+-      if (String(s2.cwd).toLowerCase() === p.toLowerCase()) {
+-        st.archived[s2.id] = true;
++      if (samePath(s2.cwd, p) && (!body.agent || s2.agent === body.agent)) {
++        st.archived[s2.id] = now();
+         count++;
+       }
+     }
+     writeConsoleState(st);
+-    SESSION_INDEX = new Map();
+-    SESSION_INDEX_AT = 0;
+     return sendJson(res, 200, { ok: true, archived: count });
+   }
+ 
+@@ -2554,7 +2543,8 @@
+   // 安全校验：必须是绝对路径、至少两级深度、不落在一个保留名单里。
+   if (url.pathname === '/api/delete-project' && req.method === 'POST') {
+     const body = await readBody(req);
+-    const target = path.resolve(String(body.path || ''));
++    if (!body.path || !path.isAbsolute(cleanPath(body.path))) return sendJson(res, 400, { error: '必须提供项目的绝对路径' });
++    const target = path.resolve(cleanPath(body.path));
+     if (!/^([a-zA-Z]:[\\/])/.test(target)) return sendJson(res, 400, { error: '路径非法' });
+     const segs = target.split(/[\\/]+/).filter(Boolean);
+     // 只拒绝盘根（如 D://）和一级目录；两级及以上的项目目录允许删
+@@ -2562,14 +2552,23 @@
+     const BLOCK = ['c:\\', 'c:\\users', 'c:\\windows', 'c:\\program files', 'd:\\', 'c:\\users\\<user>'];
+     if (BLOCK.includes(target.toLowerCase()) || BLOCK.some((b) => target.toLowerCase() === path.resolve(b).toLowerCase()))
+       return sendJson(res, 400, { error: '拒绝删除受保护目录' });
+-    if (!fs.existsSync(target)) return sendJson(res, 404, { error: '目录不存在' });
+-    fs.rmSync(target, { recursive: true, force: true });
++    const protectedPaths = [HERE, path.resolve(HERE, '../../..'), HOME, P.codexHome, P.wbHome, P.dshHome,
++      process.env.SystemRoot, process.env.ProgramFiles].filter(Boolean);
++    const realTarget = exists(target) ? fs.realpathSync(target) : target;
++    const contains = (parent, child) => samePath(parent, child) || pathKey(child).startsWith(pathKey(parent) + path.sep);
++    if (protectedPaths.some((p) => contains(realTarget, p) || contains(p, realTarget) && !samePath(p, HOME)))
++      return sendJson(res, 400, { error: '拒绝删除控制台、代理数据或系统目录；请使用「从列表移除」' });
++    const existed = exists(target);
++    if (existed) {
++      if (fs.lstatSync(target).isSymbolicLink()) return sendJson(res, 400, { error: '项目是目录链接，请使用「从列表移除」' });
++      fs.rmSync(realTarget, { recursive: true, force: true });
++    }
+     // 同步从控制台的列表里移除
+     const st = readConsoleState();
+     if (Array.isArray(st.hiddenProjects)) st.hiddenProjects.push(target);
+     st.pinned = (st.pinned || []).filter((x) => x.toLowerCase() !== target.toLowerCase());
+     writeConsoleState(st);
+-    return sendJson(res, 200, { ok: true });
++    return sendJson(res, 200, { ok: true, removedDirectory: existed });
+   }
+ 
+   if (url.pathname === '/api/sessions/pin' && req.method === 'POST') {
+@@ -2590,7 +2589,8 @@
+     if (!p) return sendJson(res, 400, { error: '缺少 path' });
+     const st = readConsoleState();
+     if (!Array.isArray(st.hiddenProjects)) st.hiddenProjects = [];
+-    if (!st.hiddenProjects.some((x) => x.toLowerCase() === p.toLowerCase())) st.hiddenProjects.push(p);
++    st.hiddenProjects = st.hiddenProjects.filter((x) => !samePath(x, p));
++    if (body.hidden !== false) st.hiddenProjects.push(path.normalize(p));
+     writeConsoleState(st);
+     return sendJson(res, 200, { ok: true });
+   }
+@@ -2606,15 +2606,15 @@
+     let removed = 0;
+     if (s.agent === 'codex') {
+       const dir = path.dirname(file);
+-      const base = path.basename(file, '.jsonl');
++      const base = path.basename(file).replace(/\.jsonl(?:\.zst)?$/, '');
+       for (const f of safe(() => fs.readdirSync(dir), [])) {
+         if (f.startsWith(base)) {
+-          safe(() => fs.rmSync(path.join(dir, f), { force: true }));
++          fs.rmSync(path.join(dir, f), { force: true });
+           removed++;
+         }
+       }
+     } else {
+-      safe(() => fs.rmSync(file, { force: true }));
++      fs.rmSync(file, { force: true });
+       removed = 1;
+     }
+     const st = readConsoleState();
+@@ -2631,7 +2631,11 @@
+     const id = typeof body.id === 'string' ? body.id.trim() : '';
+     if (!id) return sendJson(res, 400, { error: 'id 不能为空' });
+     const state = readConsoleState();
+-    if (body.archived === false) delete state.archived[id];
++    if (body.archived === false) {
++      state.archived[id] = false;
++      const session = sessionIndex().get(id);
++      if (session) state.hiddenProjects = state.hiddenProjects.filter((p) => !samePath(p, session.cwd));
++    }
+     else state.archived[id] = now();
+     writeConsoleState(state);
+     invalidateProjects();
+@@ -2707,6 +2711,10 @@
+     res.writeHead(200, { 'content-type': MIME[path.extname(file)] || 'application/octet-stream', 'cache-control': 'no-store' });
+     res.end(buf);
+   });
++  } catch (error) {
++    if (!res.headersSent) sendJson(res, 500, { error: error.message || String(error) });
++    else res.end();
++  }
+ });
+ 
+ setInterval(() => {
+@@ -2747,7 +2755,7 @@
+  *   2. 每秒盯一次父进程，父进程没了就自己退出，把端口还回去。
+  * ================================================================== */
+ 
+-const IDENTITY_FILE = path.join(HERE, '.console-server.json');
++const IDENTITY_FILE = process.env.CONSOLE_IDENTITY_FILE || path.join(HERE, '.console-server.json');
+ const PARENT_PID = Number(process.env.CONSOLE_PARENT_PID || process.ppid);
+ const IDENTITY_STARTED = Date.now();
+ 
+--- before/public/app-ui.js
++++ after/public/app-ui.js
+@@ -36,6 +36,19 @@
+   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+ };
+ 
++async function apiPost(url, body) {
++  const res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
++  const data = await res.json();
++  if (!res.ok || data.error) throw new Error(data.error || `服务返回 ${res.status}`);
++  return data;
++}
++function notify(text, bad = false) {
++  let el = $('operation-status');
++  if (!el) { el = document.createElement('div'); el.id = 'operation-status'; el.setAttribute('role', 'status'); document.body.append(el); }
++  el.textContent = text; el.dataset.bad = String(bad); el.hidden = false;
++  clearTimeout(notify.timer); notify.timer = setTimeout(() => { el.hidden = true; }, bad ? 9000 : 3500);
++}
++
+ /* ================= 项目 ================= */
+ 
+ const STORE = {
+@@ -88,7 +101,9 @@
+   }
+ }
+ 
++let projectsRequest = 0;
+ async function loadProjects(opts = {}) {
++  const request = ++projectsRequest;
+   if (!opts.silent) {
+     const rl = document.getElementById('sess-search');
+     if (rl) rl.placeholder = '⏳ 正在刷新项目与会话…';
+@@ -99,9 +114,11 @@
+   for (let attempt = 0; attempt < 3; attempt++) {
+     try {
+       const j = await fetchProjects();
++      if (request !== projectsRequest) return;
+       S.agents = j.agents || [];
+       S.projects = j.projects || [];
+       S.archived = j.archived || [];
++      renderHiddenProjects(j.hiddenProjects || []);
+       setRailStatus('');
+       renderProjects();
+       renderArchive();
+@@ -115,13 +132,17 @@
+ 
+       if (pick) {
+         if (!isOpen(pick) && !S.expandAll) setOpen(pick, true);
+-        selectProject(pick, { keepFold: true });
++        if (!S.project || S.project.path !== pick.path || S.project.agent !== pick.agent) {
++          selectProject(pick, { keepFold: true });
++        } else { S.project = pick; $('proj-name').textContent = pick.name; }
++
+       } else {
+         $('projects').innerHTML = `<div class="changes-empty" style="padding:12px 10px">
+           还没有可识别的项目。点上面「新建项目」填一个绝对路径，或在任意一家智能体里先跑一次会话。</div>`;
+       }
+       return;
+     } catch (e) {
++      if (request !== projectsRequest) return;
+       const last = attempt === 2;
+       const msg = e.name === 'AbortError' ? '请求超时（服务没有响应）' : e.message || String(e);
+       if (last) {
+@@ -202,7 +223,7 @@
+         <span class="project-name"><i class="dot"></i>${esc(p.name)}<i class="sess-count">${active.length}</i></span>
+         ${p.isRepo ? `<span class="proj-tags"><i class="tag">git</i></span>` : ''}
+       </button>
+-      <button class="proj-new" title="在这个项目里新建会话">＋</button>
++      <button class="proj-new" aria-label="在这个项目里新建会话" title="在这个项目里新建会话"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10"/></svg></button>
+       <button class="proj-tw" title="${open ? '收起会话' : '展开会话'}"><i>▾</i></button>
+     </div>
+     <div class="sess-list">${active.map(sessionRow).join('') || `<div class="sess empty"><span class="stitle">暂无会话</span></div>`}</div>
+@@ -221,7 +242,7 @@
+     </button>
+     <div class="abody">${
+       (a.projects || []).map((p) => projectNode({ ...p, agent: p.agent || a.id })).join('') ||
+-      `<div class="sess empty"><span class="stitle">暂无项目</span></div>`
++      `<div class="sess empty"><span class="stitle">暂无未归档项目</span><button class="rail-mini" data-open-recovery>查看归档与隐藏项目</button></div>`
+     }</div>
+   </div>`;
+ }
+@@ -230,6 +251,7 @@
+   const rl0 = document.getElementById('sess-search');
+   if (rl0 && rl0.placeholder.indexOf('⏳') === 0) rl0.placeholder = '🔍 搜索会话…';
+   const host = $('projects');
++  const scrollTop = host.scrollTop;
+   if (!S.agents || !S.agents.length) {
+     host.innerHTML = `<div class="changes-empty" style="padding:12px 10px">还没有项目。点上面「新建项目」填一个绝对路径。</div>`;
+     return;
+@@ -260,6 +282,7 @@
+     // 数据里可能缺 agent，补上后再用
+     const proj = { ...p, agent: p.agent || agentId };
+     node.querySelector('.project').addEventListener('click', () => {
++      $('rail').classList.remove('dim-current');
+       // 点项目名：先写入折叠状态，再由 selectProject 的渲染按新状态出图
+       const next = node.dataset.open === 'false';
+       setOpen(proj, next);
+@@ -286,12 +309,14 @@
+     node.querySelectorAll('.arc').forEach((b) =>
+       b.addEventListener('click', async (e) => {
+         e.stopPropagation();
+-        await archiveSession(b.dataset.arc, true);
++        try { await archiveSession(b.dataset.arc, true); } catch (error) { notify(error.message, true); }
+       }),
+     );
+   });
+ 
+   syncCollapseAll();
++  host.scrollTop = scrollTop;
++  host.querySelectorAll('[data-open-recovery]').forEach((button) => button.addEventListener('click', () => openSheet(true)));
+ }
+ 
+ function syncCollapseAll() {
+@@ -306,12 +331,8 @@
+ /* ================= 归档 ================= */
+ 
+ async function archiveSession(id, archived) {
+-  const res = await fetch('/api/sessions/archive', {
+-    method: 'POST',
+-    headers: { 'content-type': 'application/json' },
+-    body: JSON.stringify({ id, archived }),
+-  });
+-  if (!res.ok) return;
++  await apiPost('/api/sessions/archive', { id, archived });
++
+   for (const a of S.agents || []) {
+     for (const p of a.projects || []) {
+       for (const x of p.sessions || []) if (x.id === id) x.archived = archived;
+@@ -319,8 +340,8 @@
+       p.archivedCount = (p.sessions || []).length - p.activeCount;
+     }
+   }
+-  renderProjects();
+-  await loadArchiveOnly();
++  await loadProjects({ silent: true });
++  notify(archived ? '会话已归档' : '会话已恢复');
+ }
+ 
+ async function loadArchiveOnly() {
+@@ -350,8 +371,25 @@
+     )
+     .join('');
+   host.querySelectorAll('[data-restore]').forEach((b) =>
+-    b.addEventListener('click', () => archiveSession(b.dataset.restore, false)),
++    b.addEventListener('click', () => archiveSession(b.dataset.restore, false).catch((error) => notify(error.message, true))),
+   );
++}
++
++function renderHiddenProjects(paths) {
++  const host = $('hidden-project-list');
++  if (!host) return;
++  host.replaceChildren();
++  if (!paths.length) { host.textContent = '没有隐藏的项目'; return; }
++  for (const path of paths) {
++    const row = document.createElement('div'); row.className = 'arc-row';
++    const label = document.createElement('span'); label.className = 'stitle'; label.textContent = path; label.title = path;
++    const button = document.createElement('button'); button.textContent = '恢复';
++    button.addEventListener('click', async () => {
++      try { await apiPost('/api/hide-project', { path, hidden: false }); await loadProjects({ silent: true }); notify('项目已恢复'); }
++      catch (error) { notify(error.message, true); }
++    });
++    row.append(label, button); host.append(row);
++  }
+ }
+ 
+ /* ================= 选中项目 ================= */
+@@ -439,7 +477,7 @@
+ const AGENTS = [
+   { id: 'codex', name: 'Codex' },
+   { id: 'workbuddy', name: 'WorkBuddy' },
+-  { id: 'dsh', name: 'dsh' },
++  { id: 'dsh', name: 'DSH' },
+ ];
+ 
+ // 档位以服务端 /api/models 返回的为主（三家各不相同），这里是兜底
+@@ -553,7 +591,8 @@
+ 
+ function remember() {
+   try {
+-    localStorage.setItem('console-picker', JSON.stringify({ agent: S.agent, model: S.model, effort: S.effort }));
++    const previous = loadRemembered();
++    localStorage.setItem('console-picker', JSON.stringify({ agent: S.agent, model: S.model, effort: S.effort, agents: { ...(previous.agents || {}), [S.agent]: { model: S.model, effort: S.effort } } }));
+   } catch {}
+ }
+ 
+@@ -565,34 +604,49 @@
+   }
+ }
+ 
++let modelsRequest = 0;
+ async function loadModels(agent) {
+-  S.agent = agent || S.agent;
++  const request = ++modelsRequest;
++  const requestedAgent = agent || S.agent;
++  S.agent = requestedAgent;
++  refreshComposerHint();
+   let models = [];
+   let efforts = EFFORTS_FALLBACK;
+   try {
+-    const res = await fetch(`/api/models?agent=${S.agent}`);
++    const res = await fetch(`/api/models?agent=${requestedAgent}`);
++    if (!res.ok) throw new Error(`模型加载失败：${res.status}`);
+     const j = await res.json();
+     models = (j.models || []).map((m) => ({ id: m.id, name: m.name }));
+     if (Array.isArray(j.efforts) && j.efforts.length) efforts = j.efforts;
+-  } catch {
+-    models = [];
+-  }
++  } catch (error) {
++    if (request === modelsRequest) notify(error.message, true);
++  }
++  if (request !== modelsRequest || S.agent !== requestedAgent) return;
+   if (!models.length) models = [{ id: '', name: '默认' }];
+ 
+   const remembered = loadRemembered();
+-  const prefer = S.model && models.some((m) => m.id === S.model) ? S.model : remembered.model;
++  const savedAgent = remembered.agents?.[requestedAgent] || (remembered.agent === requestedAgent ? remembered : {});
++  const prefer = savedAgent.model || (models.some((m) => m.id === S.model) ? S.model : '');
+   ddModel.set(models, prefer);
+   S.model = ddModel.get();
+ 
+   // 三家都支持推理档位，但档位集合不同：
+   // Codex 走 -c model_reasoning_effort，WorkBuddy 走 --effort，dsh 走 --patch 覆盖 agent-default-model
+-  const prev = S.effort || remembered.effort || '';
++  const prev = savedAgent.effort || S.effort || '';
+   const fallback = efforts.some((e) => e.id === 'medium') ? 'medium' : efforts[0].id;
+   const pick = efforts.some((e) => e.id === prev) ? prev : fallback;
+   ddEffort.set(efforts, pick);
+   S.effort = ddEffort.get();
+   remember();
+ }
++
++$('messages').addEventListener('click', (e) => {
++  const link = e.target.closest('a[href]');
++  if (!link || !/^https?:\/\//i.test(link.href)) return;
++  e.preventDefault();
++  if (window.consoleNative) window.consoleNative.openExternal(link.href);
++  else window.open(link.href, '_blank', 'noopener');
++});
+ 
+ /* ================= 消息 ================= */
+ 
+@@ -668,6 +722,8 @@
+ 
+ /** 在指定项目里开始一段全新会话（清空对话区，第一条消息发出即建会话） */
+ function startNewThread(proj) {
++  replayGeneration++;
++  S.replaying = false;
+   S.thread = null;
+   if (S.replayTimer) {
+     clearInterval(S.replayTimer);
+@@ -691,16 +747,6 @@
+   } catch {}
+   const host = $('messages');
+   host.innerHTML = '';
+-  // 消息里的链接：统一走系统默认浏览器（事件委托，绑一次）
+-  host.addEventListener('click', (e) => {
+-    const a = e.target.closest('a[href]');
+-    if (!a) return;
+-    const href = a.getAttribute('href');
+-    if (/^https?:\/\//i.test(href)) {
+-      e.preventDefault();
+-      window.consoleNative?.openExternal(href);
+-    }
+-  });
+   if (!S.history.length) {
+     host.innerHTML = `<div class="empty" id="empty">
+       <h2>开始一段新的对话</h2>
+@@ -805,6 +851,7 @@
+ }
+ 
+ function scrollBottom() {
++  if (S.replaying) return;
+   const m = $('messages');
+   if (m.scrollHeight - m.scrollTop - m.clientHeight < 160) m.scrollTop = m.scrollHeight;
+ }
+@@ -933,8 +980,13 @@
+ });
+ 
+ async function send() {
++  const text = promptEl.value.trim();
++  if (!text || S.busy) return;
++  if (!S.project) return notify('先选一个项目', true);
+   // 历史会话是只读回放：一旦发消息就进入新一轮，把它收掉
+   if (S.thread) {
++    replayGeneration++;
++    S.replaying = false;
+     S.thread = null;
+     // 关键：同时清回放轮询与计数 —— 否则在途的轮询请求会把旧会话的
+     // 消息/产物卡片渲染进刚清空的新对话里
+@@ -949,10 +1001,6 @@
+     saveHistory();
+     renderProjects();
+   }
+-  const text = promptEl.value.trim();
+-  if (!text || S.busy) return;
+-  if (!S.project) return alert('先选一个项目');
+-
+   addMessage({ role: 'user', text, attachments: S.atts });
+   promptEl.value = '';
+   promptEl.style.height = 'auto';
+@@ -971,7 +1019,7 @@
+         cwd: S.project.path,
+         agent: S.agent,
+         model: S.model || undefined,
+-        effort: S.agent === 'codex' ? S.effort || undefined : undefined,
++        effort: S.effort || undefined,
+         mode: S.mode,
+         attachments,
+       }),
+@@ -1449,11 +1497,7 @@
+     const name = input.value.trim();
+     input.remove();
+     if (!name || name === oldName) return;
+-    await fetch('/api/rename', {
+-      method: 'POST',
+-      headers: { 'content-type': 'application/json' },
+-      body: JSON.stringify({ kind, id, path, name }),
+-    });
++    await apiPost('/api/rename', { kind, id, path, name });
+     await loadProjects();
+   };
+   input.addEventListener('keydown', (e) => {
+@@ -1484,12 +1528,12 @@
+     ctxTarget = { kind: 'session', id, title };
+     items.push(
+       { label: pinnedNow ? '📉 取消置顶' : '📌 置顶', act: async () => {
+-          await fetch('/api/sessions/pin', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, pinned: !pinnedNow }) });
++          await apiPost('/api/sessions/pin', { id, pinned: !pinnedNow });
+           await loadProjects();
+         } },
+       { label: '✏️ 重命名', act: () => renameVia('session', id, '', title) },
+       { label: '📦 归档', act: async () => {
+-          await fetch('/api/sessions/archive', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, archived: true }) });
++          await apiPost('/api/sessions/archive', { id, archived: true });
+           if (S.thread && S.thread.id === id) exitThread(false);
+           await loadProjects();
+         } },
+@@ -1497,15 +1541,16 @@
+           if (!confirm(`删除这条会话？
+ ${title}
+ 
+-将同时从对应的 Agent 桌面端删除，不可恢复。`)) return;
+-          await fetch('/api/delete-session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }) });
++将删除本机对应的会话记录文件，不可恢复。`)) return;
++          await apiPost('/api/delete-session', { id });
+           if (S.thread && S.thread.id === id) exitThread(false);
+           await loadProjects();
+         }, danger: true },
+     );
+   } else {
+     const row = projEl.querySelector('.project');
+-    const path = row ? row.title : '';
++    const path = projEl.closest('.pnode')?.dataset.path || '';
++    const agent = projEl.closest('.pnode')?.dataset.agent || '';
+     const nameEl = projEl.querySelector('.project-name');
+     const name = (nameEl ? nameEl.textContent.replace(/\d+$/, '').trim() : '') || path;
+     ctxTarget = { kind: 'project', path };
+@@ -1513,21 +1558,20 @@
+       { label: '✏️ 重命名', act: () => renameVia('project', '', path, name) },
+       { label: '📦 归档全部会话', act: async () => {
+           if (!confirm(`归档项目「${name}」下的全部会话？\nAgent 侧的会话文件不会被删除。`)) return;
+-          await fetch('/api/archive-project', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path }) });
++          await apiPost('/api/archive-project', { path, agent });
+           exitThread(false);
+           await loadProjects();
+         } },
+       { label: '📂 从列表移除', act: async () => {
+           if (!confirm(`把项目从列表移除？\n${path}\n\n真实目录不会被删除。`)) return;
+-          await fetch('/api/hide-project', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path }) });
++          await apiPost('/api/hide-project', { path });
+           await loadProjects();
+         } },
+       { label: '🗑 删除项目（含目录）', act: async () => {
+-          if (!confirm(`⚠️ 将真实删除整个项目目录：\n${path}\n\n目录内所有文件（含 Agent 会话）都会被删除，不可恢复！`)) return;
++          if (!confirm(`⚠️ 将真实删除整个项目目录：\n${path}\n\n目录内所有文件都会被删除，不可恢复！代理集中保存的历史会话仍保留。`)) return;
+           if (!confirm('再次确认：真的要删除整个目录吗？此操作不可逆。')) return;
+-          const r = await fetch('/api/delete-project', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path }) });
+-          const j = await r.json();
+-          if (!r.ok) { alert(j.error || '删除失败'); return; }
++          await apiPost('/api/delete-project', { path });
++
+           if (S.project && S.project.path === path) exitThread(false);
+           await loadProjects();
+         }, danger: true },
+@@ -1541,7 +1585,8 @@
+     if (it.danger) b.className = 'danger';
+     b.addEventListener('click', async () => {
+       hideCtx();
+-      await it.act();
++      try { notify('正在处理…'); await it.act(); notify('操作完成'); }
++      catch (error) { notify(error.message || '操作失败', true); }
+     });
+     ctxMenu.appendChild(b);
+   }
+@@ -1572,11 +1617,14 @@
+ });
+ 
+ /* 项目高亮淡化：点击侧栏以外的区域后，选中项目的黑色高亮退为圆点标识 */
+-document.addEventListener('mousedown', (e) => {
++document.addEventListener('pointerdown', (e) => {
+   const rail = document.getElementById('rail');
+   if (!rail) return;
+-  rail.classList.toggle('dim-current', !rail.contains(e.target));
+-});
++  const project = e.target.closest('.project');
++  rail.classList.toggle('dim-current', !project);
++});
++
++document.addEventListener('focusin', (e) => { if (!e.target.closest('.project')) $('rail').classList.add('dim-current'); });
+ 
+ /* ================= 选中消息的浮动操作条 ================= */
+ 
+@@ -1779,6 +1827,8 @@
+ };
+ 
+ function exitThread(redraw = true) {
++  replayGeneration++;
++  S.replaying = false;
+   if (!S.thread) return;
+   S.thread = null;
+   if (S.replayTimer) {
+@@ -1805,6 +1855,9 @@
+     selectProject(project, { keepThread: true, keepFold: true });
+   }
+ 
++  replayGeneration++;
++  S.replaying = false;
++  S.filesExpanded = false;
+   S.thread = { id, agent: project.agent, title: '' };
+   const bar = $('thread-bar');
+   bar.hidden = false;
+@@ -1822,7 +1875,7 @@
+     // 读取期间用户可能已切换/关闭会话 —— 丢弃过期数据，防止显示别的会话
+     if (!S.thread || S.thread.id !== id) return;
+     if (!res.ok) throw new Error(j.error || `服务返回 ${res.status}`);
+-    paintThread(j);
++    await paintThread(j);
+   } catch (e) {
+     host.innerHTML = `<div class="thread-loading">${esc(e.message || '读取失败')}</div>`;
+     $('tb-title').textContent = '读取失败';
+@@ -1832,7 +1885,9 @@
+ let threadData = null;
+ let threadCompact = true;
+ 
+-function paintThread(d, keepScroll) {
++let replayGeneration = 0;
++async function paintThread(d, keepScroll) {
++  const generation = ++replayGeneration;
+   threadData = d;
+   S.replayCount = (d.messages || []).length;
+   const __last = (d.messages || [])[(d.messages || []).length - 1];
+@@ -1886,7 +1941,7 @@
+       const host = $('messages');
+       S.replayStick = host.scrollHeight - host.scrollTop - host.clientHeight < 80;
+       S.replayScrollTop = S.replayStick ? 0 : host.scrollTop;
+-      paintThread(j, true);
++      await paintThread(j, true);
+       // 实时同步呼吸指示
+       $('tb-meta').textContent = '● 实时同步中';
+       $('tb-meta').classList.add('live');
+@@ -1899,9 +1954,14 @@
+     } catch {}
+   }, 3000);
+ 
++  let rendered = 0;
+   for (const m of msgs) {
++    if (++rendered % 40 === 0) {
++      await new Promise((resolve) => setTimeout(resolve, 0));
++      if (generation !== replayGeneration || S.thread?.id !== d.id) return;
++    }
+     // 回放显示消息的真实时间；assistant 用 Markdown 渲染（其余保持纯文本）
+-    if (m.role === 'user') addMessage({ role: 'user', text: m.text, ts: m.ts });
++    if (m.role === 'user') addMessage({ role: 'user', text: m.text, ts: m.ts, attachments: m.attachments });
+     else if (m.role === 'assistant') {
+       // addMessage 返回 .msg-body 元素，assistant 直接以 Markdown 渲染
+       const body = addMessage({ role: 'assistant', agent: d.agent, text: '', ts: m.ts });
+@@ -1926,6 +1986,7 @@
+     const card = document.createElement('div');
+     card.className = 'files-card';
+     card.innerHTML = `<div class="files-head">产物 / 涉及文件 <b>${files.length}</b></div>`;
++    const head = card.querySelector('.files-head');
+     const body = document.createElement('div');
+     body.className = 'files-body';
+     const makeRow = (p) => {
+@@ -1943,39 +2004,27 @@
+       });
+       return row;
+     };
+-    for (const p of files.slice(0, 2)) body.appendChild(makeRow(p));
+-    if (files.length > 2) {
+-      const rest = files.slice(2);
+-      const collapse = () => {
+-        body.querySelectorAll('.file-row').forEach((r, idx) => {
+-          if (idx >= 2) r.remove();
+-        });
+-        card.querySelectorAll('.files-less-top').forEach((x) => x.remove());
+-        body.appendChild(more);
+-      };
+-      const more = document.createElement('button');
+-      more.className = 'files-more';
+-      more.type = 'button';
+-      more.textContent = `展开全部 ${files.length} 个文件`;
+-      more.addEventListener('click', () => {
+-        for (const p of rest) body.appendChild(makeRow(p));
+-        more.remove();
+-        // 「收起」同时放在卡片头部右侧，不用滑到底部找
+-        const lessTop = document.createElement('button');
+-        lessTop.className = 'files-less-top';
+-        lessTop.type = 'button';
+-        lessTop.textContent = '收起';
+-        lessTop.addEventListener('click', collapse);
+-        head.appendChild(lessTop);
+-        const less = document.createElement('button');
+-        less.className = 'files-more';
+-        less.type = 'button';
+-        less.textContent = '收起';
+-        less.addEventListener('click', collapse);
+-        body.appendChild(less);
++    const renderFiles = (expanded) => {
++      body.replaceChildren();
++      head.querySelector('.files-less-top')?.remove();
++      for (const p of expanded ? files : files.slice(0, 2)) body.appendChild(makeRow(p));
++      if (files.length <= 2) return;
++      const toggle = document.createElement('button');
++      toggle.className = 'files-more'; toggle.type = 'button';
++      toggle.setAttribute('aria-expanded', String(expanded));
++      toggle.textContent = expanded ? '收起' : `展开其余 ${files.length - 2} 个文件`;
++      toggle.addEventListener('click', () => {
++        const top = host.scrollTop;
++        S.filesExpanded = !expanded; renderFiles(!expanded); host.scrollTop = top;
+       });
+-      body.appendChild(more);
+-    }
++      body.appendChild(toggle);
++      if (expanded) {
++        const less = toggle.cloneNode(true); less.className = 'files-less-top';
++        less.addEventListener('click', () => { S.filesExpanded = false; renderFiles(false); });
++        head.appendChild(less);
++      }
++    };
++    renderFiles(!!S.filesExpanded);
+     card.appendChild(body);
+     host.appendChild(card);
+   }
+@@ -1985,15 +2034,14 @@
+   if (keepScroll) {
+     host.scrollTop = host.scrollHeight - host.clientHeight <= 80 || S.replayStick
+       ? host.scrollHeight
+-      : S.replayScrollTop || host.scrollHeight;
++      : S.replayScrollTop ?? host.scrollHeight;
+     return;
+   }
+   const toBottom = () => {
+     host.scrollTop = host.scrollHeight;
+   };
+   requestAnimationFrame(toBottom);
+-  setTimeout(toBottom, 80);
+-  setTimeout(toBottom, 300);
++
+ }
+ 
+ $('btn-thread-close').addEventListener('click', () => exitThread());
+--- before/public/app.css
++++ after/public/app.css
+@@ -1241,3 +1241,14 @@
+   content: '▸'; margin-left: auto; color: var(--ink-faint); font-size: 10px;
+ }
+ details.arch-fold[open] > summary.sheet-label::after { content: '▾'; }
++
++/* Codex 2026-10-26: SVG keeps the plus centered independent of font metrics. */
++.proj-new { padding: 0; box-sizing: border-box; }
++.proj-new svg { width: 14px; height: 14px; display: block; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; }
++.files-card .files-head { display: flex; align-items: center; gap: 8px; }
++.files-card .files-less-top { margin-left: auto; }
++.files-card .file-body { flex: 1; overflow: hidden; }
++.files-card .file-path { display: block; flex: initial; max-width: 100%; }
++#operation-status { position: fixed; z-index: 200; bottom: 110px; left: 50%; transform: translateX(-50%); max-width: min(80vw, 600px); padding: 12px 18px; border: 1px solid var(--edge); border-radius: 12px; background: var(--surface); color: var(--ink); box-shadow: 0 8px 32px #0004; }
++#operation-status[data-bad="true"] { border-color: #db6969; }
++.messages .msg { content-visibility: auto; contain-intrinsic-size: auto 120px; }
+--- before/public/index.html
++++ after/public/index.html
+@@ -187,7 +187,7 @@
+     </div>
+ 
+     <div class="sheet-group">
+-      <details class="arch-fold" open>
++      <details class="arch-fold">
+         <summary class="sheet-label">
+           <span>已归档会话</span>
+           <button class="rail-mini" id="btn-archive-refresh">刷新</button>
+@@ -198,6 +198,13 @@
+       </details>
+     </div>
+ 
++    <div class="sheet-group">
++      <details class="arch-fold">
++        <summary class="sheet-label">已隐藏项目</summary>
++        <div class="archive-list" id="hidden-project-list"></div>
++      </details>
++    </div>
++
+     <p class="sheet-note">
+       项目与会话来自三家真实落盘记录：Codex <code>sessions/**/rollout-*.jsonl</code>、
+       WorkBuddy <code>projects/&lt;slug&gt;/*.jsonl</code>、dsh <code>sessions/*/*/session.v4.jsonl.zstd</code>（逐帧解码）。

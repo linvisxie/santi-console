@@ -1,0 +1,1 @@
+import fs from 'node:fs';const s=fs.readFileSync('D:/workbuddy/resources/app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs','utf8');const end=s.indexOf('this.createClient(P,E)');console.log(s.slice(end-2400,end+120));for(const m of s.matchAll(/getCurrentSession\(/g)){console.log(s.slice(m.index-80,m.index+170));break;}

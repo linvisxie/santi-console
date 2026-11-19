@@ -1,0 +1,123 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import zlib from 'node:zlib';
+import { spawn } from 'node:child_process';
+
+const root = path.resolve('tools/.qa-fixtures');
+const project = path.join(root, 'project');
+const other = path.join(root, 'other');
+const stateFile = path.join(root, 'state.json');
+fs.mkdirSync(project, { recursive: true }); fs.mkdirSync(other, { recursive: true });
+fs.writeFileSync(stateFile, '{}');
+const write = (file, content) => { fs.mkdirSync(path.dirname(file), {recursive:true}); fs.writeFileSync(file, content); };
+const jl = rows => rows.map(x=>JSON.stringify(x)).join('\n')+'\n';
+const cx = path.join(root,'.codex/sessions/2026/10/26/rollout-fixture.jsonl');
+const longText=('完整消息标记：'+ '长消息 '.repeat(500)).trim();
+const rows=[{type:'session_meta',payload:{cwd:project}}];
+for(let n=0;n<650;n++) rows.push({type:'response_item',timestamp:new Date(1700000000000+n).toISOString(),payload:{type:'message',role:n%2?'assistant':'user',content:[{type:n%2?'output_text':'input_text',text:`历史 ${n}`}]}});
+rows.splice(321,0,{type:'ignored',padding:'x'.repeat(10<<20)});
+rows.push({type:'response_item',payload:{type:'message',role:'assistant',content:[{type:'output_text',text:longText}]}});
+rows.push({type:'response_item',payload:{type:'custom_tool_call',name:'apply_patch',input:'*** Begin Patch\n*** Add File: one.md\n+x\n*** Add File: two.js\n+x\n*** Add File: three.css\n+x\n*** End Patch'}});
+write(cx,jl(rows));
+write(path.join(root,'.codex/archived_sessions/rollout-compressed.jsonl.zst'),zlib.zstdCompressSync(Buffer.from(jl([{type:'session_meta',payload:{cwd:project}},{type:'response_item',payload:{type:'message',role:'user',content:[{type:'input_text',text:'压缩历史完整正文'}]}}]))));
+for(let n=0;n<45;n++) write(path.join(root,`.workbuddy/projects/test/wb-${n}.jsonl`),jl([{type:'message',cwd:other,role:'user',content:[{type:'text',text:'用户提问'+n}]},{type:'message',role:'assistant',content:[{type:'text',text:longText}]}]));
+for(let n=0;n<35;n++) write(path.join(root,`.dsh/sessions/test/dsh-${n}/session.v4.jsonl.zstd`),zlib.zstdCompressSync(Buffer.from(jl([{type:'session',id:`dsh-${n}`,cwd:project},{type:'user/message',data:{content:[{type:'text',text:'DSH 提问'}]}},{type:'assistant/message',data:{message:{content:[{type:'text',text:longText}]}}}]))));
+const server=spawn(process.execPath,['runtime/resources/app/server.mjs'],{env:{...process.env,CONSOLE_PORT:'7801',CONSOLE_DATA_HOME:root,CONSOLE_STATE_FILE:stateFile,CONSOLE_IDENTITY_FILE:path.join(root,'identity.json')},stdio:['ignore','pipe','pipe'],windowsHide:true});
+let stderr='';server.stderr.on('data',b=>stderr+=b);
+const base='http://127.0.0.1:7801';
+let assertions=0; const check=(name,value)=>{assert.ok(value,name);assertions++;console.log('PASS',name)};
+const get=async p=>{const r=await fetch(base+p);const j=await r.json();assert.equal(r.status,200,JSON.stringify(j));return j;};
+const post=async(p,b)=>{const r=await fetch(base+p,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(b)});return {status:r.status,...await r.json()};};
+let ws, originalUrl;
+try {
+ for(let i=0;i<80;i++){try{await get('/api/identify');break;}catch{await new Promise(r=>setTimeout(r,100));}}
+ let j=await get('/api/projects');
+ check('all 45 WB transcripts indexed',j.agents.find(a=>a.id==='workbuddy').sessionCount===45);
+ check('all 35 DSH sessions indexed',j.agents.find(a=>a.id==='dsh').sessionCount===35);
+ check('compressed archive indexed',j.archived.some(s=>s.id==='codex:rollout-compressed'));
+ const d=await get('/api/session?id=codex:rollout-fixture');
+ check('more than 600 messages retained',d.messages.length===652);
+ check('middle of >10 MB transcript retained',d.messages.some(m=>m.text==='历史 320'));
+ check('long final text retained',d.messages.some(m=>m.text===longText));
+ check('all patch artifact paths retained',d.files.length===3);
+ const wb=await get('/api/session?id=wb:test/wb-0');check('WB long response untruncated',wb.messages[1].text===longText);
+ const compressed=await get('/api/session?id=codex:rollout-compressed');check('zstd full replay',compressed.messages[0].text==='压缩历史完整正文');
+ const ds=await get('/api/session?id=dsh:dsh-0');check('DSH full response',ds.messages[1].text===longText);
+ await post('/api/rename',{kind:'project',path:other,name:'项目别名'});
+ j=await get('/api/projects');check('rename invalidates warm cache',j.projects.find(p=>p.path===other).name==='项目别名');
+ await post('/api/hide-project',{path:other.toUpperCase().replaceAll('\\','/')});
+ j=await get('/api/projects');check('hide uses canonical Windows paths',!j.projects.some(p=>p.agent==='workbuddy'));
+ await post('/api/hide-project',{path:other,hidden:false});
+ j=await get('/api/projects');check('hidden project restored',j.projects.some(p=>p.agent==='workbuddy'));
+ await post('/api/archive-project',{path:project.replaceAll('\\','/'),agent:'codex'});
+ j=await get('/api/projects');check('archive project refreshes immediately',!j.projects.some(p=>p.agent==='codex'));
+ check('archive scoped to agent',j.agents.find(a=>a.id==='dsh').sessionCount===35);
+ await post('/api/sessions/archive',{id:'codex:rollout-compressed',archived:false});
+ j=await get('/api/projects');check('restore compressed archive',j.projects.some(p=>p.agent==='codex'&&p.activeCount===1));
+ const unsafe=await post('/api/delete-project',{path:path.resolve('.')});check('console deletion protected',unsafe.status===400);
+ const blank=await post('/api/delete-project',{});check('empty deletion path rejected',blank.status===400);
+ const deletionDir=fs.mkdtempSync(path.join(os.tmpdir(),'santi-console-delete-fixture-'));write(path.join(deletionDir,'nested/file.txt'),'fixture only');
+ check('verified deletion fixture is under OS temp',path.dirname(deletionDir)===os.tmpdir());
+ const deleted=await post('/api/delete-project',{path:deletionDir});check('only isolated fixture deleted',deleted.status===200&&!fs.existsSync(deletionDir));
+ const again=await post('/api/delete-project',{path:deletionDir});check('missing project can be removed',again.status===200&&again.removedDirectory===false);
+ await post('/api/sessions/archive',{id:'codex:rollout-fixture',archived:false});
+ // Connect to the already-running Electron; navigate only if no execution is active.
+ const targets=await(await fetch('http://127.0.0.1:9224/json/list')).json();
+ const target=targets.find(t=>t.type==='page');assert.ok(target);
+ ws=new WebSocket(target.webSocketDebuggerUrl);await new Promise(r=>ws.addEventListener('open',r,{once:true}));
+ let serial=0;const pending=new Map();const errors=[];
+ ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.id){const p=pending.get(m.id);if(p){pending.delete(m.id);m.error?p.reject(new Error(JSON.stringify(m.error))):p.resolve(m.result);}}else if(m.method==='Runtime.exceptionThrown')errors.push(m.params.exceptionDetails.text+': '+m.params.exceptionDetails.exception?.description);};
+ const rpc=(method,params={})=>new Promise((resolve,reject)=>{const id=++serial;pending.set(id,{resolve,reject});ws.send(JSON.stringify({id,method,params}));});
+ const ev=async expression=>{const r=await rpc('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true});if(r.exceptionDetails)throw new Error(JSON.stringify(r.exceptionDetails));return r.result?.value;};
+ originalUrl=await ev('location.href');
+ for(let n=0;n<100;n++){if(await ev('typeof S!=="undefined"'))break;await new Promise(r=>setTimeout(r,100));}
+ check('existing Electron has no active run',await ev('!S.busy'));
+ await rpc('Runtime.enable');await rpc('Page.navigate',{url:base+'/?snap=1'});
+ for(let n=0;n<100;n++){await new Promise(r=>setTimeout(r,100));if(await ev('typeof S!=="undefined" && S.projects.length>0'))break;}
+ check('page loads real fixture projects',await ev('S.projects.length>=3'));
+ await ev(`openThread('codex:rollout-fixture',S.projects.find(p=>p.agent==='codex'))`);
+ check('652-record history rendered without clipping',await ev('document.querySelectorAll(".msg").length===651'));
+ check('artifact initial preview exactly two',await ev('document.querySelectorAll(".files-card .file-row").length===2'));
+ await ev('document.querySelector(".files-more").click()');
+ check('artifact expand shows all three',await ev('document.querySelectorAll(".files-card .file-row").length===3'));
+ await ev('document.querySelector(".files-less-top").click()');
+ await ev('document.querySelector(".files-more").click();document.querySelector(".files-more").click()');
+ check('repeated expansion has no leftover controls',await ev('document.querySelectorAll(".files-card .file-row").length===2 && document.querySelectorAll(".files-card .files-more").length===1'));
+ check('settings before monitor',await ev('!!($("btn-settings").compareDocumentPosition($("btn-view-monitor")) & Node.DOCUMENT_POSITION_FOLLOWING)'));
+ check('archive starts collapsed',await ev('!document.querySelector("details.arch-fold").open'));
+ await ev('$("btn-settings").click();document.querySelector("details.arch-fold summary").click()');
+ check('archive expands on click',await ev('document.querySelector("details.arch-fold").open'));
+ await ev('openSheet(false);document.querySelector(".project").click()');
+ check('project click highlights',await ev('!$("rail").classList.contains("dim-current")'));
+ await ev('$("btn-settings").dispatchEvent(new PointerEvent("pointerdown",{bubbles:true}));$("btn-settings").click()');
+ check('sidebar setting button removes highlight',await ev('$("rail").classList.contains("dim-current")'));
+ await ev('openSheet(false)');
+ const center=await ev('(()=>{const b=document.querySelector(".proj-new").getBoundingClientRect(),s=document.querySelector(".proj-new svg").getBoundingClientRect();return Math.max(Math.abs(b.x+b.width/2-s.x-s.width/2),Math.abs(b.y+b.height/2-s.y-s.height/2))})()');
+ check('plus centered to subpixel tolerance',center<0.1);
+ await ev('Promise.all([loadModels("workbuddy"),loadModels("dsh"),loadModels("codex")])');
+ check('late model response cannot replace current agent',await ev('S.agent==="codex" && !!S.model'));
+ await ev(`openThread('codex:rollout-fixture',S.projects.find(p=>p.agent==='codex'))`);
+ await ev('loadProjects({silent:true})');check('refresh preserves history',await ev('S.thread?.id==="codex:rollout-fixture"'));
+ await ev('document.documentElement.dataset.theme="dark"');
+ const shot=await rpc('Page.captureScreenshot',{format:'png'});write('tools/qa-codex-repair.png',Buffer.from(shot.data,'base64'));
+ await ev('$("prompt").value="";send()');
+ check('empty send preserves open history',await ev('S.thread?.id==="codex:rollout-fixture"'));
+ const sentEffort=await ev(`(async()=>{const original=window.fetch;let payload;window.fetch=async(url,opts)=>url==='/api/chat'?(payload=JSON.parse(opts.body),{ok:false,json:async()=>({error:'测试拦截，未调用模型'})}):original(url,opts);try{S.agent='workbuddy';S.effort='high';$('prompt').value='仅验证参数';await send();return payload.effort;}finally{window.fetch=original;setBusy(false);}})()`);
+ check('WB effort sent without model invocation',sentEffort==='high');
+ check('no browser runtime exceptions',errors.length===0);
+ const removed=await post('/api/delete-session',{id:'wb:test/wb-44'});
+ check('delete session removes only fixture transcript',removed.status===200&&!fs.existsSync(path.join(root,'.workbuddy/projects/test/wb-44.jsonl')));
+ const afterDelete=await get('/api/projects');
+ check('delete session refreshes index immediately',afterDelete.agents.find(a=>a.id==='workbuddy').sessionCount===44);
+ console.log(JSON.stringify({assertions,errors,screenshot:'tools/qa-codex-repair.png'},null,2));
+ write('tools/qa-codex-repair-results.json',JSON.stringify({assertions,errors,date:new Date().toISOString()},null,2));
+ await rpc('Page.navigate',{url:originalUrl});originalUrl=null;
+ ws.close();
+} finally {
+ if(ws&&originalUrl){try{ws.send(JSON.stringify({id:99999,method:'Page.navigate',params:{url:originalUrl}}));await new Promise(r=>setTimeout(r,300));}catch{}ws.close();}
+ server.kill();
+}
+
+
